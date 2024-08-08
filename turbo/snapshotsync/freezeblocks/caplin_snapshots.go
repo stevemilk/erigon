@@ -118,7 +118,7 @@ func (s *CaplinSnapshots) LS() {
 		return
 	}
 	if s.BeaconBlocks != nil {
-		for _, seg := range s.BeaconBlocks.segments {
+		for _, seg := range s.BeaconBlocks.visibleSegments {
 			if seg.Decompressor == nil {
 				continue
 			}
@@ -126,7 +126,7 @@ func (s *CaplinSnapshots) LS() {
 		}
 	}
 	if s.BlobSidecars != nil {
-		for _, seg := range s.BlobSidecars.segments {
+		for _, seg := range s.BlobSidecars.visibleSegments {
 			if seg.Decompressor == nil {
 				continue
 			}
@@ -137,12 +137,12 @@ func (s *CaplinSnapshots) LS() {
 
 func (s *CaplinSnapshots) SegFilePaths(from, to uint64) []string {
 	var res []string
-	for _, seg := range s.BeaconBlocks.segments {
+	for _, seg := range s.BeaconBlocks.visibleSegments {
 		if seg.from >= from && seg.to <= to {
 			res = append(res, seg.FilePath())
 		}
 	}
-	for _, seg := range s.BlobSidecars.segments {
+	for _, seg := range s.BlobSidecars.visibleSegments {
 		if seg.from >= from && seg.to <= to {
 			res = append(res, seg.FilePath())
 		}
@@ -187,7 +187,7 @@ Loop:
 		case snaptype.CaplinEnums.BeaconBlocks:
 			var sn *Segment
 			var exists bool
-			for _, sn2 := range s.BeaconBlocks.segments {
+			for _, sn2 := range s.BeaconBlocks.dirtySegments {
 				if sn2.Decompressor == nil { // it's ok if some segment was not able to open
 					continue
 				}
@@ -219,7 +219,7 @@ Loop:
 			if !exists {
 				// it's possible to iterate over .seg file even if you don't have index
 				// then make segment available even if index open may fail
-				s.BeaconBlocks.segments = append(s.BeaconBlocks.segments, sn)
+				s.BeaconBlocks.dirtySegments = append(s.BeaconBlocks.dirtySegments, sn)
 			}
 			if err := sn.reopenIdxIfNeed(s.dir, optimistic); err != nil {
 				return err
@@ -236,7 +236,7 @@ Loop:
 		case snaptype.CaplinEnums.BlobSidecars:
 			var sn *Segment
 			var exists bool
-			for _, sn2 := range s.BlobSidecars.segments {
+			for _, sn2 := range s.BlobSidecars.dirtySegments {
 				if sn2.Decompressor == nil { // it's ok if some segment was not able to open
 					continue
 				}
@@ -268,7 +268,7 @@ Loop:
 			if !exists {
 				// it's possible to iterate over .seg file even if you don't have index
 				// then make segment available even if index open may fail
-				s.BlobSidecars.segments = append(s.BlobSidecars.segments, sn)
+				s.BlobSidecars.dirtySegments = append(s.BlobSidecars.dirtySegments, sn)
 			}
 			if err := sn.reopenIdxIfNeed(s.dir, optimistic); err != nil {
 				return err
@@ -286,9 +286,10 @@ Loop:
 	return nil
 }
 
+// TODO@steven: refactor this function and where it's used
 func (s *CaplinSnapshots) idxAvailability() uint64 {
 	var beaconBlocks uint64
-	for _, seg := range s.BeaconBlocks.segments {
+	for _, seg := range s.BeaconBlocks.visibleSegments {
 		if seg.Index() == nil {
 			break
 		}
@@ -312,7 +313,7 @@ func (s *CaplinSnapshots) ReopenFolder() error {
 
 func (s *CaplinSnapshots) closeWhatNotInList(l []string) {
 Loop1:
-	for i, sn := range s.BeaconBlocks.segments {
+	for i, sn := range s.BeaconBlocks.dirtySegments {
 		if sn.Decompressor == nil {
 			continue Loop1
 		}
@@ -323,13 +324,13 @@ Loop1:
 			}
 		}
 		sn.close()
-		s.BeaconBlocks.segments[i] = nil
+		s.BeaconBlocks.dirtySegments[i] = nil
 	}
 	var i int
-	for i = 0; i < len(s.BeaconBlocks.segments) && s.BeaconBlocks.segments[i] != nil && s.BeaconBlocks.segments[i].Decompressor != nil; i++ {
+	for i = 0; i < len(s.BeaconBlocks.dirtySegments) && s.BeaconBlocks.dirtySegments[i] != nil && s.BeaconBlocks.dirtySegments[i].Decompressor != nil; i++ {
 	}
-	tail := s.BeaconBlocks.segments[i:]
-	s.BeaconBlocks.segments = s.BeaconBlocks.segments[:i]
+	tail := s.BeaconBlocks.dirtySegments[i:]
+	s.BeaconBlocks.dirtySegments = s.BeaconBlocks.dirtySegments[:i]
 	for i = 0; i < len(tail); i++ {
 		if tail[i] != nil {
 			tail[i].close()
@@ -337,7 +338,7 @@ Loop1:
 		}
 	}
 Loop2:
-	for i, sn := range s.BlobSidecars.segments {
+	for i, sn := range s.BlobSidecars.dirtySegments {
 		if sn.Decompressor == nil {
 			continue Loop2
 		}
@@ -348,13 +349,13 @@ Loop2:
 			}
 		}
 		sn.close()
-		s.BlobSidecars.segments[i] = nil
+		s.BlobSidecars.dirtySegments[i] = nil
 	}
 
-	for i = 0; i < len(s.BlobSidecars.segments) && s.BlobSidecars.segments[i] != nil && s.BlobSidecars.segments[i].Decompressor != nil; i++ {
+	for i = 0; i < len(s.BlobSidecars.dirtySegments) && s.BlobSidecars.dirtySegments[i] != nil && s.BlobSidecars.dirtySegments[i].Decompressor != nil; i++ {
 	}
-	tail = s.BlobSidecars.segments[i:]
-	s.BlobSidecars.segments = s.BlobSidecars.segments[:i]
+	tail = s.BlobSidecars.dirtySegments[i:]
+	s.BlobSidecars.dirtySegments = s.BlobSidecars.dirtySegments[:i]
 	for i = 0; i < len(tail); i++ {
 		if tail[i] != nil {
 			tail[i].close()
@@ -385,8 +386,8 @@ func (v *CaplinView) Close() {
 
 }
 
-func (v *CaplinView) BeaconBlocks() []*Segment { return v.s.BeaconBlocks.segments }
-func (v *CaplinView) BlobSidecars() []*Segment { return v.s.BlobSidecars.segments }
+func (v *CaplinView) BeaconBlocks() []*Segment { return v.s.BeaconBlocks.visibleSegments }
+func (v *CaplinView) BlobSidecars() []*Segment { return v.s.BlobSidecars.visibleSegments }
 
 func (v *CaplinView) BeaconBlocksSegment(slot uint64) (*Segment, bool) {
 	for _, seg := range v.BeaconBlocks() {
@@ -684,7 +685,7 @@ func (s *CaplinSnapshots) FrozenBlobs() uint64 {
 	minSegFrom := ((s.beaconCfg.SlotsPerEpoch * s.beaconCfg.DenebForkEpoch) / snaptype.Erigon2MergeLimit) * snaptype.Erigon2MergeLimit
 	foundMinSeg := false
 	ret := uint64(0)
-	for _, seg := range s.BlobSidecars.segments {
+	for _, seg := range s.BlobSidecars.visibleSegments {
 		if seg.from == minSegFrom {
 			foundMinSeg = true
 		}
