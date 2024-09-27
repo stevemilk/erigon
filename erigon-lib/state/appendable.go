@@ -328,13 +328,16 @@ func (ap *Appendable) openDirtyFiles() error {
 }
 
 func (ap *Appendable) closeWhatNotInList(fNames []string) {
+	files := make(map[string]struct{}, len(fNames))
+	for _, f := range fNames {
+		files[f] = struct{}{}
+	}
 	var toClose []*filesItem
 	ap.dirtyFiles.Walk(func(items []*filesItem) bool {
-	Loop1:
 		for _, item := range items {
-			for _, protectName := range fNames {
-				if item.decompressor != nil && item.decompressor.FileName() == protectName {
-					continue Loop1
+			if item.decompressor != nil {
+				if _, ok := files[item.decompressor.FileName()]; ok {
+					continue
 				}
 			}
 			toClose = append(toClose, item)
