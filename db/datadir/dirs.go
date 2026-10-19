@@ -124,6 +124,13 @@ func New(datadir string) Dirs {
 // absolute path stuff I don't want.
 const SnapDir = "snapshots"
 
+// SnapshotLayerDir holds what the snapshot layer derives on its own, such as receipts imported from
+// era archives, apart from the node's state so that a node started on the datadir never sees it.
+const SnapshotLayerDir = "snapshot-layer"
+
+// SnapshotLayer returns the snapshot layer's own directories, without creating them.
+func (d Dirs) SnapshotLayer() Dirs { return Open(filepath.Join(d.DataDir, SnapshotLayerDir)) }
+
 // Open new Dirs instance without forcing all the directories to exist.
 func Open(datadir string) Dirs {
 	relativeDataDir := datadir
