@@ -77,10 +77,10 @@ func TestImportEraReceiptsResumes(t *testing.T) {
 func newEraReceiptsDatadir(t *testing.T) datadir.Dirs {
 	t.Helper()
 	dirs := datadir.New(t.TempDir())
-	layer := dirs.SnapshotLayer()
-	require.NoError(t, os.MkdirAll(layer.Snap, 0o755))
+	eraDirs := dirs.EraReceipts()
+	require.NoError(t, os.MkdirAll(eraDirs.Snap, 0o755))
 	settings := []byte("step_size = 5000\nsteps_in_frozen_file = 4\nreferences_in_commitment_branches = false\n")
-	require.NoError(t, os.WriteFile(filepath.Join(layer.Snap, "erigondb.toml"), settings, 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(eraDirs.Snap, "erigondb.toml"), settings, 0o644))
 	return dirs
 }
 
@@ -138,15 +138,15 @@ func requireReceiptsImported(t *testing.T, dirs datadir.Dirs, blocks uint64) {
 		}
 	}
 
-	layer := dirs.SnapshotLayer()
-	require.NotEmpty(t, mustGlob(t, layer.SnapHistory, "*-rcache.*.v"))
-	require.NotEmpty(t, mustGlob(t, layer.SnapIdx, "*-logaddrs.*.ef"))
-	require.NotEmpty(t, mustGlob(t, layer.SnapIdx, "*-logtopics.*.ef"))
+	eraDirs := dirs.EraReceipts()
+	require.NotEmpty(t, mustGlob(t, eraDirs.SnapHistory, "*-rcache.*.v"))
+	require.NotEmpty(t, mustGlob(t, eraDirs.SnapIdx, "*-logaddrs.*.ef"))
+	require.NotEmpty(t, mustGlob(t, eraDirs.SnapIdx, "*-logtopics.*.ef"))
 	for _, d := range []string{dirs.SnapDomain, dirs.SnapHistory, dirs.SnapIdx, dirs.SnapAccessors} {
 		require.Emptyf(t, mustGlob(t, d, "*"), "the node's own state directories stay untouched: %s", d)
 	}
 	require.NoFileExists(t, filepath.Join(dirs.Snap, "salt-state.txt"), "the node's state salt stays untouched")
-	for _, d := range []string{layer.SnapDomain, layer.SnapHistory, layer.SnapIdx} {
+	for _, d := range []string{eraDirs.SnapDomain, eraDirs.SnapHistory, eraDirs.SnapIdx} {
 		for _, name := range []string{"accounts", "storage", "code", "commitment", "receipt.", "tracesfrom", "tracesto"} {
 			require.Emptyf(t, mustGlob(t, d, "*-"+name+"*"), "no %s files: nothing executed", name)
 		}
@@ -178,16 +178,16 @@ func TestImportEraReceiptsMergesAndPrunes(t *testing.T) {
 	require.NoError(t, importEraReceipts(t, eraDir, dirs))
 	requireReceiptsImported(t, dirs, 2*era.MaxBlocksPerFile)
 
-	layer := dirs.SnapshotLayer()
+	eraDirs := dirs.EraReceipts()
 	for _, pattern := range []string{"*-rcache.0-4.v", "*-logaddrs.0-4.ef", "*-logtopics.0-4.ef"} {
-		dir := layer.SnapIdx
+		dir := eraDirs.SnapIdx
 		if filepath.Ext(pattern) == ".v" {
-			dir = layer.SnapHistory
+			dir = eraDirs.SnapHistory
 		}
 		require.NotEmptyf(t, mustGlob(t, dir, pattern), "%s: the first frozen file of 4 steps", pattern)
 	}
 
-	db := mdbx.New(dbcfg.ChainDB, log.New()).Path(layer.Chaindata).MustOpen()
+	db := mdbx.New(dbcfg.ChainDB, log.New()).Path(eraDirs.Chaindata).MustOpen()
 	defer db.Close()
 	require.NoError(t, db.View(t.Context(), func(tx kv.Tx) error {
 		first, err := kv.FirstKey(tx, kv.TblRCacheHistoryKeys)
@@ -200,9 +200,9 @@ func TestImportEraReceiptsMergesAndPrunes(t *testing.T) {
 
 	// A reader opens every domain. Pruning must not have marked the ones that were off as pruned
 	// past their (absent) files.
-	settings, err := dbstate.ResolveErigonDBSettings(layer, log.New(), true)
+	settings, err := dbstate.ResolveErigonDBSettings(eraDirs, log.New(), true)
 	require.NoError(t, err)
-	agg, err := dbstate.New(layer).Logger(log.New()).WithErigonDBSettings(settings).Open(t.Context())
+	agg, err := dbstate.New(eraDirs).Logger(log.New()).WithErigonDBSettings(settings).Open(t.Context())
 	require.NoError(t, err)
 	defer agg.Close()
 	require.NoError(t, agg.OpenFolder(db))

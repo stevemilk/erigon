@@ -87,16 +87,16 @@ func ImportEraReceipts(ctx context.Context, eraDir string, dirs datadir.Dirs, ch
 	return nil
 }
 
-// openEraReceiptsDB opens the snapshot layer's directories with only the receipt cache and the log
+// openEraReceiptsDB opens the era receipts directories with only the receipt cache and the log
 // indexes switched on, so that nothing else is opened or built. Blocks are read from the datadir's
 // own segments, which the node shares.
 func openEraReceiptsDB(ctx context.Context, dirs datadir.Dirs, chainConfig *chain.Config, logger log.Logger) (*temporal.DB, *BlockReader, func(), error) {
-	layer := dirs.SnapshotLayer()
-	dir.MustExist(layer.Chaindata, layer.SnapDomain, layer.SnapHistory, layer.SnapIdx, layer.SnapAccessors)
-	if _, err := dbstate.GetStateIndicesSalt(layer, true, logger); err != nil {
+	eraDirs := dirs.EraReceipts()
+	dir.MustExist(eraDirs.Chaindata, eraDirs.SnapDomain, eraDirs.SnapHistory, eraDirs.SnapIdx, eraDirs.SnapAccessors)
+	if _, err := dbstate.GetStateIndicesSalt(eraDirs, true, logger); err != nil {
 		return nil, nil, nil, err
 	}
-	settings, err := dbstate.ResolveErigonDBSettings(layer, logger, true)
+	settings, err := dbstate.ResolveErigonDBSettings(eraDirs, logger, true)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -112,7 +112,7 @@ func openEraReceiptsDB(ctx context.Context, dirs datadir.Dirs, chainConfig *chai
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	rawDB, err := mdbx.New(dbcfg.ChainDB, logger).Path(layer.Chaindata).Open(ctx)
+	rawDB, err := mdbx.New(dbcfg.ChainDB, logger).Path(eraDirs.Chaindata).Open(ctx)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -122,7 +122,7 @@ func openEraReceiptsDB(ctx context.Context, dirs datadir.Dirs, chainConfig *chai
 		}
 	}()
 	statecfg.EnableHistoricalRCache()
-	agg, err := dbstate.New(layer).Logger(logger).WithErigonDBSettings(settings).Open(ctx)
+	agg, err := dbstate.New(eraDirs).Logger(logger).WithErigonDBSettings(settings).Open(ctx)
 	if err != nil {
 		return nil, nil, nil, err
 	}
