@@ -375,6 +375,10 @@ func (m *MissedAccessorIIFiles) IsEmpty() bool {
 
 func (at *AggregatorRoTx) DbgDomain(idx kv.Domain) *DomainRoTx         { return at.d[idx] }
 func (at *AggregatorRoTx) DbgII(idx kv.InvertedIdx) *InvertedIndexRoTx { return at.searchII(idx) }
+
+// DbgHistoryII returns the inverted index of a domain's history: the files HistorySeek searches.
+func (at *AggregatorRoTx) DbgHistoryII(d kv.Domain) *InvertedIndexRoTx { return at.d[d].ht.iit }
+
 func (at *AggregatorRoTx) searchII(idx kv.InvertedIdx) *InvertedIndexRoTx {
 	for i := 0; i < at.iisCount; i++ {
 		if at.iis[i].name == idx {

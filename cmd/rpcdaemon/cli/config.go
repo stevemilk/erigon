@@ -637,7 +637,7 @@ func startRegularRpcServer(ctx context.Context, cfg *httpcfg.HttpCfg, rpcAPI []r
 	// register apis and create handler stack
 	srv := rpc.NewServer(cfg.RpcBatchConcurrency, cfg.TraceRequests, cfg.DebugSingleRequest, cfg.RpcStreamingDisable, logger, cfg.RPCSlowLogThreshold)
 
-	allowListForRPC, err := parseAllowListForRPC(cfg.RpcAllowListFilePath)
+	allowListForRPC, err := allowListForRPC(cfg)
 	if err != nil {
 		return err
 	}
