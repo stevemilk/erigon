@@ -29,10 +29,14 @@ import (
 	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/common/math"
 	"github.com/erigontech/erigon/db/kv/prune"
+	"github.com/erigontech/erigon/db/rawdb"
 	"github.com/erigontech/erigon/db/snapcfg"
 	"github.com/erigontech/erigon/db/snapshotsync/freezeblocks"
+	"github.com/erigontech/erigon/db/snaptype"
+	"github.com/erigontech/erigon/db/snaptype2"
 	"github.com/erigontech/erigon/execution/chain"
 	"github.com/erigontech/erigon/execution/chain/networkname"
+	chainspec "github.com/erigontech/erigon/execution/chain/spec"
 	"github.com/erigontech/erigon/execution/execmodule/execmoduletester"
 	"github.com/erigontech/erigon/execution/rlp"
 	"github.com/erigontech/erigon/execution/tests/blockgen"
@@ -74,6 +78,11 @@ func TestDump(t *testing.T) {
 		},
 		{
 			chainSize:   50,
+			chainConfig: chain.AllProtocolChanges,
+		},
+		{
+			// eth chain -> epoch: block dump carves 1024-aligned segments
+			chainSize:   1024,
 			chainConfig: chain.AllProtocolChanges,
 		},
 	}
@@ -128,28 +137,28 @@ func TestDump(t *testing.T) {
 		t.Run("headers", func(t *testing.T) {
 			require := require.New(t)
 			var nonceList []uint64
-			_, err := freezeblocks.DumpHeadersRaw(m.Ctx, m.DB, m.ChainConfig, 0, uint64(2*test.chainSize), nil, func(v []byte) error {
+			_, err := freezeblocks.DumpHeadersRaw(m.Ctx, m.DB, 0, uint64(2*test.chainSize), func(v []byte) error {
 				h := types.Header{}
 				if err := rlp.DecodeBytes(v[1:], &h); err != nil {
 					return err
 				}
 				nonceList = append(nonceList, h.Number.Uint64())
 				return nil
-			}, 1, log.LvlInfo, log.New(), true)
+			}, log.LvlInfo, log.New(), true)
 			require.NoError(err)
 			require.Equal(nonceRange(0, test.chainSize), nonceList)
 		})
 		t.Run("headers_not_from_zero", func(t *testing.T) {
 			require := require.New(t)
 			var nonceList []uint64
-			_, err := freezeblocks.DumpHeadersRaw(m.Ctx, m.DB, m.ChainConfig, 2, uint64(test.chainSize), nil, func(v []byte) error {
+			_, err := freezeblocks.DumpHeadersRaw(m.Ctx, m.DB, 2, uint64(test.chainSize), func(v []byte) error {
 				h := types.Header{}
 				if err := rlp.DecodeBytes(v[1:], &h); err != nil {
 					return err
 				}
 				nonceList = append(nonceList, h.Number.Uint64())
 				return nil
-			}, 1, log.LvlInfo, log.New(), true)
+			}, log.LvlInfo, log.New(), true)
 			require.NoError(err)
 			require.Equal(nonceRange(2, test.chainSize-1), nonceList)
 		})
@@ -209,10 +218,6 @@ func TestDump(t *testing.T) {
 			require.Equal(lastTxNum, firstTxNum+uint64(i*3))
 		})
 		t.Run("blocks", func(t *testing.T) {
-			if test.chainSize < 1000 || test.chainSize%1000 != 0 {
-				t.Skip("Block dump requires chain size to be a multiple of 1000")
-			}
-
 			require := require.New(t)
 
 			logger := log.New()
@@ -221,7 +226,15 @@ func TestDump(t *testing.T) {
 			snConfig, _ := snapcfg.KnownCfg(networkname.Mainnet)
 			snConfig.ExpectBlocks = math.MaxUint64
 
-			err := freezeblocks.DumpBlocks(m.Ctx, 0, uint64(test.chainSize), m.ChainConfig, tmpDir, snapDir, m.DB, 1, log.LvlInfo, logger, m.BlockReader, snConfig, nil)
+			// production only ever retires whole segments; feed DumpBlocks the segmentable prefix
+			// (a chain shorter than one segment yields none), matching the chain's regime.
+			minSeg := uint64(snaptype.Erigon2MinSegmentSize)
+			if snaptype2.RegimeFor(test.chainConfig) {
+				minSeg = snaptype.EpochMinSegmentSize
+			}
+			blockTo := uint64(test.chainSize) / minSeg * minSeg
+
+			err := freezeblocks.DumpBlocks(m.Ctx, 0, blockTo, m.ChainConfig, tmpDir, snapDir, m.DB, 1, log.LvlInfo, logger, m.BlockReader, snConfig, nil)
 			require.NoError(err)
 		})
 	}
@@ -263,4 +276,29 @@ func createDumpTestKV(t *testing.T, chainConfig *chain.Config, chainSize int) *e
 	}
 
 	return m
+}
+
+// The block-segment regime is scoped to Ethereum-family chains: RegimeFor is epoch for eth and
+// decimal for Aura (Gnosis).
+func TestRegimeForByChain(t *testing.T) {
+	require.True(t, snaptype2.RegimeFor(chain.AllProtocolChanges))
+	require.False(t, snaptype2.RegimeFor(chainspec.Gnosis.Config))
+}
+
+// A record that is not one whole transaction never becomes frozen: the dump decodes every
+// transaction before it writes the segment, so the block files cannot hold a malformed one.
+func TestDumpTxsRejectsMalformedStoredTxn(t *testing.T) {
+	m := createDumpTestKV(t, chain.AllProtocolChanges, 3)
+
+	rwTx, err := m.DB.BeginRw(m.Ctx)
+	require.NoError(t, err)
+	defer rwTx.Rollback()
+	hash, err := rawdb.ReadCanonicalHash(rwTx, 2)
+	require.NoError(t, err)
+	_, err = rawdb.WriteRawBody(rwTx, hash, 2, &types.RawBody{Transactions: [][]byte{{0xc0}}})
+	require.NoError(t, err)
+	require.NoError(t, rwTx.Commit())
+
+	_, err = freezeblocks.DumpTxs(m.Ctx, m.DB, m.ChainConfig, 0, 4, nil, func([]byte) error { return nil }, 1, log.LvlInfo, log.New())
+	require.ErrorContains(t, err, "rlp")
 }

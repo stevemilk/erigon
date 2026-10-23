@@ -36,11 +36,15 @@ import (
 	"github.com/erigontech/erigon/db/version"
 	"github.com/erigontech/erigon/execution/chain"
 	"github.com/erigontech/erigon/execution/chain/networkname"
-	"github.com/erigontech/erigon/execution/rlp"
 	"github.com/erigontech/erigon/execution/types"
 )
 
 func init() {
+	// the core block segments (headers/bodies/transactions) are the ones eligible for the epoch
+	// (era1-aligned) layout; register their enums so snaptype gates epoch strictly to them.
+	for _, t := range BlockSnapshotTypes {
+		snaptype.RegisterEpochType(t.Enum())
+	}
 	ethereumTypes := make([]snaptype.Type, 0, len(BlockSnapshotTypes)+len(snaptype.CaplinSnapshotTypes))
 	ethereumTypes = append(ethereumTypes, BlockSnapshotTypes...)
 	ethereumTypes = append(ethereumTypes, snaptype.CaplinSnapshotTypes...)
@@ -51,6 +55,14 @@ func init() {
 	snapcfg.RegisterKnownTypes(networkname.Chiado, ethereumTypes)
 	snapcfg.RegisterKnownTypes(networkname.Hoodi, ethereumTypes)
 	snapcfg.RegisterKnownTypes(networkname.Bloatnet, ethereumTypes)
+}
+
+// RegimeFor reports whether block segments on this chain use the epoch (era1-aligned, block/1024)
+// layout. Only Ethereum-family chains do; Aura (Gnosis) keeps the decimal layout. This is the single
+// chain->regime decision; everything else reads FileInfo.Epoch or is threaded this value from a
+// production entry point.
+func RegimeFor(chainConfig *chain.Config) bool {
+	return chainConfig != nil && chainConfig.Aura == nil
 }
 
 var Enums = struct {
@@ -94,7 +106,7 @@ var (
 		Enums.Salt,
 		"salt",
 		snaptype.Versions{
-			Current:      version.ZeroVersion, //2,
+			Current:      version.ZeroVersion, // 2,
 			MinSupported: version.ZeroVersion,
 		},
 		nil,
@@ -132,7 +144,8 @@ var (
 					return fmt.Errorf("HeadersIdx: %w", err)
 				}
 				return nil
-			}),
+			},
+		),
 	)
 
 	Bodies = snaptype.RegisterType(
@@ -166,7 +179,8 @@ var (
 					return fmt.Errorf("can't index %s: %w", info.Name(), err)
 				}
 				return nil
-			}),
+			},
+		),
 	)
 
 	Transactions = snaptype.RegisterType(
@@ -236,7 +250,8 @@ var (
 					BucketSize: recsplit.DefaultBucketSize,
 					LeafSize:   recsplit.DefaultLeafSize,
 					TmpDir:     tmpDir,
-					IndexFile:  filepath.Join(sn.Dir(), sn.Type.IdxFileName(Indexes.TxnHash.Version.Current, sn.From, sn.To)),
+					IndexFile: filepath.Join(sn.Dir(), sn.Type.IdxFileName(Indexes.TxnHash.Version.Current, sn.Epoch,
+						sn.From, sn.To)),
 					BaseDataID: baseTxnID.U64(),
 				}, logger)
 				if err != nil {
@@ -251,7 +266,7 @@ var (
 					LeafSize:   recsplit.DefaultLeafSize,
 					TmpDir:     tmpDir,
 					IndexFile: filepath.Join(sn.Dir(),
-						sn.Type.IdxFileName(Indexes.TxnHash2BlockNum.Version.Current,
+						sn.Type.IdxFileName(Indexes.TxnHash2BlockNum.Version.Current, sn.Epoch,
 							sn.From, sn.To, Indexes.TxnHash2BlockNum)),
 					BaseDataID: firstBlockNum,
 				}, logger)
@@ -272,10 +287,10 @@ var (
 					g, bodyGetter := d.MakeGetter(), bodiesSegment.MakeGetter()
 					var ti, offset, nextPos uint64
 					blockNum := firstBlockNum
-					body := &types.BodyForStorage{}
+					body := &types.BodyOnlyTxn{}
 
 					bodyBuf, _ = bodyGetter.Next(bodyBuf[:0])
-					if err := rlp.DecodeBytes(bodyBuf, body); err != nil {
+					if err := body.DecodeRLPBytes(bodyBuf); err != nil {
 						return err
 					}
 
@@ -294,7 +309,7 @@ var (
 							}
 
 							bodyBuf, _ = bodyGetter.Next(bodyBuf[:0])
-							if err := rlp.DecodeBytes(bodyBuf, body); err != nil {
+							if err := body.DecodeRLPBytes(bodyBuf); err != nil {
 								return err
 							}
 
@@ -332,8 +347,12 @@ var (
 					if err := txnHashIdx.Build(ctx); err != nil {
 						if errors.Is(err, recsplit.ErrCollision) {
 							logger.Warn("Building recsplit. Collision happened. It's ok. Restarting with another salt...", "err", err)
-							txnHashIdx.ResetNextSalt()
-							txnHash2BlockNumIdx.ResetNextSalt()
+							if resetErr := txnHashIdx.ResetNextSalt(); resetErr != nil {
+								return resetErr
+							}
+							if resetErr := txnHash2BlockNumIdx.ResetNextSalt(); resetErr != nil {
+								return resetErr
+							}
 							continue
 						}
 						return fmt.Errorf("txnHashIdx: %w", err)
@@ -341,8 +360,12 @@ var (
 					if err := txnHash2BlockNumIdx.Build(ctx); err != nil {
 						if errors.Is(err, recsplit.ErrCollision) {
 							logger.Warn("Building recsplit. Collision happened. It's ok. Restarting with another salt...", "err", err)
-							txnHashIdx.ResetNextSalt()
-							txnHash2BlockNumIdx.ResetNextSalt()
+							if resetErr := txnHashIdx.ResetNextSalt(); resetErr != nil {
+								return resetErr
+							}
+							if resetErr := txnHash2BlockNumIdx.ResetNextSalt(); resetErr != nil {
+								return resetErr
+							}
 							continue
 						}
 						return fmt.Errorf("txnHash2BlockNumIdx: %w", err)
@@ -350,7 +373,8 @@ var (
 
 					return nil
 				}
-			}),
+			},
+		),
 	)
 	Domains = snaptype.RegisterType(
 		Enums.Domains,
@@ -401,19 +425,19 @@ var (
 func TxsAmountBasedOnBodiesSnapshots(bodiesSegment *seg.Decompressor, len uint64) (baseTxID types.BaseTxnID, expectedCount int, err error) {
 	gg := bodiesSegment.MakeGetter()
 	buf, _ := gg.Next(nil)
-	firstBody := &types.BodyForStorage{}
-	if err = rlp.DecodeBytes(buf, firstBody); err != nil {
+	firstBody := &types.BodyOnlyTxn{}
+	if err = firstBody.DecodeRLPBytes(buf); err != nil {
 		return
 	}
 	baseTxID = firstBody.BaseTxnID
 
-	lastBody := new(types.BodyForStorage)
+	lastBody := new(types.BodyOnlyTxn)
 	i := uint64(0)
 	for gg.HasNext() {
 		i++
 		if i == len {
 			buf, _ = gg.Next(buf[:0])
-			if err = rlp.DecodeBytes(buf, lastBody); err != nil {
+			if err = lastBody.DecodeRLPBytes(buf); err != nil {
 				return
 			}
 			if gg.HasNext() {

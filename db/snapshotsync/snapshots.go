@@ -147,9 +147,13 @@ func findOverlaps[T SortedRange](in []T) (res []T, overlapped []T) {
 	return res, overlapped
 }
 
-func CanRetire(from, to uint64, snapType snaptype.Enum, snCfg *snapcfg.Cfg, retireStep uint64) (blockFrom, blockTo uint64, can bool) {
+func CanRetire(epoch bool, from, to uint64, snapType snaptype.Enum, snCfg *snapcfg.Cfg, retireStep uint64) (blockFrom, blockTo uint64, can bool) {
 	if to <= from {
 		return
+	}
+	// The epoch ladder is 1024 -> 8192 -> 65536 -> 524288; retireStep can lower only its smallest tier.
+	if epoch {
+		return canRetireEpoch(from, to, epochMinSegmentSize(retireStep))
 	}
 	if retireStep == 0 {
 		retireStep = 1_000
@@ -157,7 +161,7 @@ func CanRetire(from, to uint64, snapType snaptype.Enum, snCfg *snapcfg.Cfg, reti
 	blockFrom = (from / retireStep) * retireStep
 	roundedToRetireStep := (to / retireStep) * retireStep
 	maxJump := retireStep
-	mergeLimit := snapcfg.MergeLimitFromCfg(snCfg, snapType, blockFrom)
+	mergeLimit := snapcfg.MergeLimitFromCfg(snCfg, snapType, epoch, blockFrom)
 	switch {
 	case blockFrom%mergeLimit == 0:
 		maxJump = mergeLimit
@@ -180,6 +184,49 @@ func CanRetire(from, to uint64, snapType snaptype.Enum, snCfg *snapcfg.Cfg, reti
 		blockTo = blockFrom
 	}
 	return blockFrom, blockTo, blockTo-blockFrom >= retireStep
+}
+
+// canRetireEpoch is CanRetire's epoch-rounded variant: the ladder is 1024 -> 8192 -> 65536
+// -> 524288 (era1-derived) instead of the decimal 1k/10k/100k/mergeLimit.
+// epochMinSegmentSize resolves the smallest epoch tier to produce. retireStep may lower it below the
+// 1024 default, but only to a power of two that still divides the 8192 era1 tier — a step that never
+// lines up with a merge span would strand its segments below the ladder forever.
+func epochMinSegmentSize(retireStep uint64) uint64 {
+	if retireStep == 0 || retireStep > snaptype.EpochMinSegmentSize || 8_192%retireStep != 0 ||
+		retireStep&(retireStep-1) != 0 {
+		return snaptype.EpochMinSegmentSize
+	}
+	return retireStep
+}
+
+func canRetireEpoch(from, to, minSize uint64) (blockFrom, blockTo uint64, can bool) {
+	blockFrom = (from / minSize) * minSize
+	roundedTo := (to / minSize) * minSize
+
+	var maxJump uint64 = minSize
+	switch {
+	case blockFrom%snaptype.EpochMergeLimit == 0:
+		maxJump = snaptype.EpochMergeLimit
+	case blockFrom%65_536 == 0:
+		maxJump = 65_536
+	case blockFrom%8_192 == 0:
+		maxJump = 8_192
+	}
+
+	jump := min(maxJump, roundedTo-blockFrom)
+	switch { // only next segment sizes are allowed
+	case jump >= snaptype.EpochMergeLimit:
+		blockTo = blockFrom + snaptype.EpochMergeLimit
+	case jump >= 65_536:
+		blockTo = blockFrom + 65_536
+	case jump >= 8_192:
+		blockTo = blockFrom + 8_192
+	case jump >= minSize:
+		blockTo = blockFrom + minSize
+	default:
+		blockTo = blockFrom
+	}
+	return blockFrom, blockTo, blockTo-blockFrom >= minSize
 }
 
 type Range struct {
@@ -205,16 +252,20 @@ type DirtySegment struct {
 	indexes []*recsplit.Index
 	segType snaptype.Type
 	version snaptype.Version
+	epoch   bool // era1-aligned ("ep"-marked, block/1024) vs decimal (block/1000)
 
 	frozen bool
 
 	canDelete atomic.Bool
+	// keepIdxFiles marks a segment whose index files a same-range survivor also resolves to.
+	keepIdxFiles atomic.Bool
 }
 
-func NewDirtySegment(segType snaptype.Type, version snaptype.Version, from uint64, to uint64, frozen bool) *DirtySegment {
+func NewDirtySegment(segType snaptype.Type, version snaptype.Version, epoch bool, from uint64, to uint64, frozen bool) *DirtySegment {
 	return &DirtySegment{
 		segType: segType,
 		version: version,
+		epoch:   epoch,
 		Range:   Range{from, to},
 		frozen:  frozen,
 	}
@@ -303,7 +354,7 @@ func (s *DirtySegment) FileName() string {
 	if s.Decompressor != nil {
 		return s.Decompressor.FileName()
 	}
-	return s.Type().FileName(s.version, s.from, s.to)
+	return s.Type().FileName(s.version, s.epoch, s.from, s.to)
 }
 
 func (s *DirtySegment) FilePaths(basePath string) (relativePaths []string) {
@@ -322,12 +373,13 @@ func (s *DirtySegment) FilePaths(basePath string) (relativePaths []string) {
 		if err != nil {
 			log.Warn("FilesItem.FilePaths: can't make basePath path", "err", err, "basePath", basePath, "path", relativePaths[i])
 		}
+		relativePaths[i] = filepath.ToSlash(relativePaths[i])
 	}
 	return relativePaths
 }
 
 func (s *DirtySegment) FileInfo(dir string) snaptype.FileInfo {
-	return s.Type().FileInfoByMask(dir, s.from, s.to)
+	return s.Type().FileInfoByMask(dir, s.epoch, s.from, s.to)
 }
 
 func (s *DirtySegment) GetRange() (from, to uint64) { return s.from, s.to }
@@ -378,11 +430,13 @@ func (s *DirtySegment) closeAndRemoveFiles() {
 		if s.Decompressor != nil {
 			toRemove = append(toRemove, s.FilePath())
 		}
-		for _, index := range s.indexes {
-			if index == nil {
-				continue
+		if !s.keepIdxFiles.Load() {
+			for _, index := range s.indexes {
+				if index == nil {
+					continue
+				}
+				toRemove = append(toRemove, index.FilePath())
 			}
-			toRemove = append(toRemove, index.FilePath())
 		}
 		s.closeIdx()
 		s.closeSeg()
@@ -391,7 +445,7 @@ func (s *DirtySegment) closeAndRemoveFiles() {
 }
 
 func (s *DirtySegment) OpenIdxIfNeed(dir string, optimistic bool, dirEntries []string) (err error) {
-	if len(s.Type().IdxFileNames(s.from, s.to)) == 0 {
+	if len(s.Type().IdxFileNames(s.epoch, s.from, s.to)) == 0 {
 		return nil
 	}
 
@@ -420,7 +474,7 @@ func (s *DirtySegment) openIdx(dir string, dirEntries []string) (err error) {
 		s.indexes = append(s.indexes, nil)
 	}
 
-	for i, fileName := range s.Type().IdxFileNames(s.from, s.to) {
+	for i, fileName := range s.Type().IdxFileNames(s.epoch, s.from, s.to) {
 		if s.indexes[i] != nil {
 			continue
 		}
@@ -444,7 +498,6 @@ func (s *DirtySegment) openIdx(dir string, dirEntries []string) (err error) {
 			return fmt.Errorf("[open index] find files by pattern err %w fname %s", os.ErrNotExist, fName)
 		}
 		index, err := recsplit.OpenIndex(fPath)
-
 		if err != nil {
 			return fmt.Errorf("%w, fileName: %s", err, fileName)
 		}
@@ -491,8 +544,8 @@ type BaseRoSnapshots struct {
 	downloadReady atomic.Bool
 	segmentsReady atomic.Bool
 
-	types []snaptype.Type //immutable
-	enums []snaptype.Enum //immutable
+	types []snaptype.Type // immutable
+	enums []snaptype.Enum // immutable
 
 	// baseSegType is the type Ranges reports against — each collection picks the one whose
 	// ranges stand for its coverage. Immutable.
@@ -513,6 +566,7 @@ type BaseRoSnapshots struct {
 	cfg               ethconfig.BlocksFreezing
 	snCfg             *snapcfg.Cfg
 	logger            log.Logger
+	removeFile        func(string) error
 
 	ready     ready
 	operators map[snaptype.Enum]*retireOperators
@@ -587,8 +641,10 @@ func newRoSnapshots(cfg ethconfig.BlocksFreezing, snapDir string, types []snapty
 		panic(fmt.Sprintf("baseSegType %s is not in types", baseSegType.Name()))
 	}
 	snCfg := snapcfg.KnownCfgOrDevnet(cfg.ChainName)
-	s := &BaseRoSnapshots{dir: snapDir, cfg: cfg, snCfg: snCfg, logger: logger,
+	s := &BaseRoSnapshots{
+		dir: snapDir, cfg: cfg, snCfg: snCfg, logger: logger,
 		types: types, enums: enums, baseSegType: baseSegType,
+		removeFile:        dir.RemoveFile,
 		dirty:             make(DirtyFiles, snaptype.MaxEnum),
 		alignMin:          alignMin,
 		operators:         map[snaptype.Enum]*retireOperators{},
@@ -621,23 +677,30 @@ func (s *BaseRoSnapshots) DownloadReady() bool           { return s.downloadRead
 func (s *BaseRoSnapshots) SegmentsReady() bool           { return s.segmentsReady.Load() }
 func (s *BaseRoSnapshots) IndicesMax() uint64            { return s.idxMax.Load() }
 func (s *BaseRoSnapshots) SegmentsMax() uint64           { return s.visible.Load().segmentsMax }
-func (s *BaseRoSnapshots) SegmentsMinByType(t snaptype.Enum) (min uint64, ok bool) {
+
+// SegmentsMin is the lowest block the visible segments reach, and whether every type
+// covers it: a type with no visible segment leaves no block complete, however low the
+// others reach, but the blocks the others do hold still start where min says.
+func (s *BaseRoSnapshots) SegmentsMin() (min uint64, complete bool) {
 	if s == nil {
 		return 0, false
 	}
 
-	minStore, exists := s.segmentsMinByType[t]
-	if !exists {
-		return 0, false
+	complete = true
+	for _, minStore := range s.segmentsMinByType {
+		typeMin := minStore.Load()
+		if typeMin == math.MaxUint64 {
+			complete = false
+			continue
+		}
+		if typeMin > min {
+			min = typeMin
+		}
 	}
 
-	min = minStore.Load()
-	if min == math.MaxUint64 {
-		return 0, false
-	}
-
-	return min, true
+	return min, complete
 }
+
 func (s *BaseRoSnapshots) BlocksAvailable() uint64 {
 	if s == nil {
 		return 0
@@ -723,7 +786,6 @@ func (s *BaseRoSnapshots) SetRangeExtractor(t snaptype.Type, rangeExtractor snap
 		s.operators[t.Enum()] = &retireOperators{
 			rangeExtractor: rangeExtractor,
 		}
-
 	}
 }
 
@@ -795,6 +857,7 @@ func (s *BaseRoSnapshots) EnableReadAhead() *BaseRoSnapshots {
 
 	return s
 }
+
 func (s *BaseRoSnapshots) MadvNormal() *BaseRoSnapshots {
 	v := s.View()
 	defer v.Close()
@@ -840,7 +903,7 @@ func buildVisibleSegments(dirtySegments *btree.BTreeG[*DirtySegment]) VisibleSeg
 				}
 			}
 
-			//protect from overlaps
+			// protect from overlaps
 			for len(newVisibleSegments) > 0 && newVisibleSegments[len(newVisibleSegments)-1].src.isSubSetOf(sn) {
 				newVisibleSegments[len(newVisibleSegments)-1].src = nil
 				newVisibleSegments = newVisibleSegments[:len(newVisibleSegments)-1]
@@ -971,6 +1034,34 @@ func (s *BaseRoSnapshots) releaseVisible(v *snapshotVisible) {
 	}
 }
 
+// pendingUnlinkNames is every retired segment a reader's pin still holds on disk. Reopening
+// one costs an fd and a mapping per rescan for as long as the pin lasts. Needs dirtyLock.
+func (s *BaseRoSnapshots) pendingUnlinkNames() map[string]struct{} {
+	var names map[string]struct{}
+	s.forEachRetired(func(sn *DirtySegment) {
+		if !sn.canDelete.Load() {
+			return // already gone from disk; nothing to reopen
+		}
+		if names == nil {
+			names = make(map[string]struct{})
+		}
+		names[sn.FileName()] = struct{}{}
+	})
+	return names
+}
+
+func (s *BaseRoSnapshots) forEachRetired(fn func(*DirtySegment)) {
+	cur := s.visible.Load()
+	for h := s.oldestVisible; h != nil; h = h.next {
+		for _, sn := range h.retired {
+			fn(sn)
+		}
+		if h == cur {
+			break
+		}
+	}
+}
+
 // reclaimRetiredLocked walks the oldest->newest chain from the head, collecting the
 // retired files of every fully-drained generation older than the current one. Must be
 // called with dirtyLock held; the returned files are deleted by the caller off-lock.
@@ -1036,14 +1127,18 @@ func (s *BaseRoSnapshots) idxAvailability() uint64 {
 	//   4. user can manually remove all .idx files of given type: `rm snapshots/*type1*.idx`
 	//   5. file-types may have different height: 10 headers, 10 bodies, 9 transactions (for example if `kill -9` came during files building/merge). still need index all 3 types.
 
+	return s.idxAvailabilityOf(s.visible.Load())
+}
+
+func (s *BaseRoSnapshots) idxAvailabilityOf(visible *snapshotVisible) uint64 {
 	if len(s.enums) == 0 {
 		return 0
 	}
 
 	var maxIdx uint64
-	visible := s.visible.Load().segments[s.enums[0]]
-	if len(visible) > 0 {
-		maxIdx = visible[len(visible)-1].to - 1
+	segments := visible.segments[s.enums[0]]
+	if len(segments) > 0 {
+		maxIdx = segments[len(segments)-1].to - 1
 	}
 
 	return maxIdx
@@ -1192,12 +1287,16 @@ func (s *BaseRoSnapshots) openSegments(fileNames []string, open bool, optimistic
 	// A repeated name resolves to the same DirtySegment twice and would schedule two
 	// concurrent OpenIdxIfNeed on it, which race on its index slice.
 	seen := make(map[string]struct{}, len(fileNames))
+	pendingUnlink := s.pendingUnlinkNames()
 
 	for _, fName := range fileNames {
 		if _, dup := seen[fName]; dup {
 			continue
 		}
 		seen[fName] = struct{}{}
+		if _, dead := pendingUnlink[fName]; dead {
+			continue
+		}
 
 		f, isState, ok := snaptype.ParseFileName(s.dir, fName)
 		if !ok || isState || f.Type == nil || snaptype.IsTorrentPartial(f.Ext) {
@@ -1218,7 +1317,7 @@ func (s *BaseRoSnapshots) openSegments(fileNames []string, open bool, optimistic
 
 		sn, exists := FindOpenSegment(segtype, fName)
 		if !exists {
-			sn = &DirtySegment{segType: f.Type, version: f.Version, Range: Range{f.From, f.To}, frozen: s.snCfg.IsFrozen(f)}
+			sn = &DirtySegment{segType: f.Type, version: f.Version, epoch: f.Epoch, Range: Range{f.From, f.To}, frozen: s.snCfg.IsFrozen(f)}
 		}
 
 		if open {
@@ -1335,7 +1434,6 @@ func (s *BaseRoSnapshots) OpenSegments(types []snaptype.Type, alignMin bool) err
 	defer s.recalcVisibleFiles(alignMin, nil)
 
 	files, err := AllTypedSegments(s.dir, types)
-
 	if err != nil {
 		return err
 	}
@@ -1393,9 +1491,11 @@ func (s *BaseRoSnapshots) detachNotInList(protect []string) retiredSegments {
 	detached := make([]*DirtySegment, 0, total)
 	for _, t := range s.enums {
 		toDelete := make([]*DirtySegment, 0, s.dirty[t].Len())
+		keptRanges := make(map[Range]struct{})
 		s.dirty[t].Walk(func(segs []*DirtySegment) bool {
 			for _, seg := range segs {
 				if _, ok := protectFiles[seg.FileName()]; ok {
+					keptRanges[seg.Range] = struct{}{}
 					continue
 				}
 				toDelete = append(toDelete, seg)
@@ -1403,6 +1503,11 @@ func (s *BaseRoSnapshots) detachNotInList(protect []string) retiredSegments {
 			return true
 		})
 		for _, seg := range toDelete {
+			// openIdx masks the version, so a kept segment of the same range resolves to
+			// the very files this one holds; unlinking them strips the survivor's index.
+			if _, shared := keptRanges[seg.Range]; shared {
+				seg.keepIdxFiles.Store(true)
+			}
 			s.dirty[t].Delete(seg)
 		}
 		detached = append(detached, toDelete...)
@@ -1542,7 +1647,7 @@ func isIndexedOnDisk(dirPath string, f snaptype.FileInfo) bool {
 	if f.Type == nil {
 		return false
 	}
-	for _, name := range f.Type.IdxFileNames(f.From, f.To) {
+	for _, name := range f.Type.IdxFileNames(f.Epoch, f.From, f.To) {
 		ok, err := dir.FileExist(filepath.Join(dirPath, name))
 		if err != nil || !ok {
 			return false
@@ -1552,10 +1657,12 @@ func isIndexedOnDisk(dirPath string, f snaptype.FileInfo) bool {
 }
 
 func (s *BaseRoSnapshots) RemoveOverlaps(onDelete func(l []string) error) error {
+	notOwned := func(f snaptype.FileInfo) bool { return !s.HasType(f.Type) }
 	list, err := snaptype.Segments(s.dir)
 	if err != nil {
 		return err
 	}
+	list = slices.DeleteFunc(list, notOwned)
 	list, superseded := supersededEqualRangeVersions(list)
 	keepSegments, segmentsToRemove := findOverlaps(list)
 	segmentsToRemove = append(segmentsToRemove, superseded...)
@@ -1568,14 +1675,18 @@ func (s *BaseRoSnapshots) RemoveOverlaps(onDelete func(l []string) error) error 
 		keepNames = append(keepNames, keepSegments[i].Name())
 	}
 
+	idxList, err := snaptype.IdxFiles(s.dir)
+	if err != nil {
+		return err
+	}
+	idxList = slices.DeleteFunc(idxList, notOwned)
+	idxList, supersededIdx := supersededEqualRangeVersions(idxList)
+	_, accessorsToRemove := findOverlaps(idxList)
+	accessorsToRemove = append(accessorsToRemove, supersededIdx...)
+
 	// Notify the seeder before deletion. Includes idx overlaps whose .seg is already gone
 	// (kill between deletes): those have no DirtySegment, so reclamation can't reach them.
 	if onDelete != nil {
-		idxList, err := snaptype.IdxFiles(s.dir)
-		if err != nil {
-			return err
-		}
-		_, accessorsToRemove := findOverlaps(idxList)
 		toRemove := make([]string, 0, len(segmentsToRemove)+len(accessorsToRemove))
 		for i := range segmentsToRemove {
 			toRemove = append(toRemove, segmentsToRemove[i].Path)
@@ -1587,8 +1698,10 @@ func (s *BaseRoSnapshots) RemoveOverlaps(onDelete func(l []string) error) error 
 		if err != nil {
 			return err
 		}
-		if err := onDelete(relativePaths); err != nil {
-			return fmt.Errorf("onDelete: %w", err)
+		if len(relativePaths) > 0 {
+			if err := onDelete(relativePaths); err != nil {
+				return fmt.Errorf("onDelete: %w", err)
+			}
 		}
 	}
 
@@ -1605,16 +1718,85 @@ func (s *BaseRoSnapshots) RemoveOverlaps(onDelete func(l []string) error) error 
 		s.recalcVisibleFiles(s.alignMin, retired)
 	}()
 
-	// remove .tmp files
-	//TODO: it may remove Caplin's useful .tmp files - re-think. Keep it here for backward-compatibility for now.
+	s.removeOrphanedIdx(supersededIdx)
+
+	// The merge is already committed by this point, so a leftover that cannot be unlinked must not
+	// be reported as a failed merge.
+	if err := s.RemoveOwnTmpFiles(); err != nil {
+		s.logger.Warn("[snapshots] could not sweep leftover .tmp files", "err", err)
+	}
+	return nil
+}
+
+// RemoveOwnTmpFiles unlinks leftover .tmp files of this collection's own types, leaving those of
+// any other collection compressing into the same directory. Safe only while this collection has no
+// compression in flight, since its own in-progress .tmp is indistinguishable from a leftover.
+func (s *BaseRoSnapshots) RemoveOwnTmpFiles() error {
 	tmpFiles, err := snaptype.TmpFiles(s.dir)
 	if err != nil {
 		return err
 	}
+	var errs []error
 	for _, f := range tmpFiles {
-		_ = dir.RemoveFile(f)
+		if !s.ownsTmpFile(f) {
+			continue
+		}
+		if err := s.removeFile(f); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, err)
+		}
 	}
-	return nil
+	return errors.Join(errs...)
+}
+
+// ownsTmpFile reports whether a .tmp in the snapshot dir could have been produced by this
+// collection. A name that does not parse is attributed to nobody and is left alone.
+//
+// Match on the resolved Type, not TypeString: TypeString is the raw name segment from the
+// filename, which for an index .tmp is the index's own name (e.g. "transactions-to-block"),
+// not its owning type's name (e.g. "transactions") — those two only coincide for segment files.
+func (s *BaseRoSnapshots) ownsTmpFile(path string) bool {
+	fileInfo, _, ok := snaptype.ParseFileName(s.dir, filepath.Base(path))
+	if !ok || fileInfo.Type == nil {
+		return false
+	}
+	return s.HasType(fileInfo.Type)
+}
+
+// removeOrphanedIdx unlinks the superseded index files neither a dirty segment nor a pinned
+// retired one has open. The read lock spans the unlink, or openSegments could reopen one.
+func (s *BaseRoSnapshots) removeOrphanedIdx(superseded []snaptype.FileInfo) {
+	if len(superseded) == 0 {
+		return
+	}
+	s.dirtyLock.RLock()
+	defer s.dirtyLock.RUnlock()
+
+	held := make(map[string]struct{})
+	hold := func(seg *DirtySegment) {
+		for _, index := range seg.indexes {
+			if index != nil {
+				held[index.FilePath()] = struct{}{}
+			}
+		}
+	}
+	for _, t := range s.enums {
+		s.dirty[t].Walk(func(segs []*DirtySegment) bool {
+			for _, seg := range segs {
+				hold(seg)
+			}
+			return true
+		})
+	}
+	s.forEachRetired(hold)
+
+	orphans := make([]string, 0, len(superseded))
+	for i := range superseded {
+		if _, ok := held[superseded[i].Path]; ok {
+			continue
+		}
+		orphans = append(orphans, superseded[i].Path)
+	}
+	removeOldFiles(orphans) // pairs each file with its .torrent, as reclamation does
 }
 
 func toRelativePaths(basePath string, absolutePaths []string) (relativePaths []string, err error) {
@@ -1624,6 +1806,7 @@ func toRelativePaths(basePath string, absolutePaths []string) (relativePaths []s
 		if err != nil {
 			return nil, fmt.Errorf("rel: %w", err)
 		}
+		relativePaths[i] = filepath.ToSlash(relativePaths[i])
 	}
 	return relativePaths, nil
 }
@@ -1884,7 +2067,8 @@ func (s *BaseRoSnapshots) buildMissedIndices(logPrefix string, ctx context.Conte
 
 	go func() {
 		defer close(finish)
-		g.Wait()
+		// g's task always returns nil; failures route through failedIndexes below.
+		_ = g.Wait()
 
 		fmu.Lock()
 		for fname, err := range failedIndexes {
@@ -1950,6 +2134,16 @@ func (s *BaseRoSnapshots) ViewSingleFile(t snaptype.Type, blockNum uint64) (segm
 
 func (v *View) Segments(t snaptype.Type) VisibleSegments {
 	return v.segments[t.Enum()]
+}
+
+// BlocksAvailable is BaseRoSnapshots.BlocksAvailable for the generation this view pins,
+// which can be behind the live one.
+func (v *View) BlocksAvailable() uint64 {
+	if v == nil || v.s == nil {
+		return 0
+	}
+
+	return v.s.idxAvailabilityOf(v.snapshotVisible)
 }
 
 func (v *View) Segment(t snaptype.Type, blockNum uint64) (*VisibleSegment, bool) {
