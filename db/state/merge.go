@@ -1086,7 +1086,13 @@ func (r Ranges) String() string {
 		}
 	}
 
-	aggStep := r.domain[kv.AccountsDomain].aggStep
+	aggStep := uint64(1)
+	for i := range r.domain {
+		if r.domain[i].aggStep > 0 {
+			aggStep = r.domain[i].aggStep
+			break
+		}
+	}
 	for _, mr := range r.invertedIndex {
 		if mr != nil && mr.needMerge {
 			ss = append(ss, fmt.Sprintf("%s(%d-%d)", mr.name, mr.from/aggStep, mr.to/aggStep))
