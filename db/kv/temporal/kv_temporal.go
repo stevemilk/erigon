@@ -79,6 +79,50 @@ type DB struct {
 	// blockFiles: block snapshots, the peer of stateFiles. Nil for state-only
 	// tools; a tx from such a DB pins no view and panics on any block read.
 	blockFiles *blocksnapshots.RoSnapshots
+
+	// readable, when set, is all the state a reader may see.
+	readable *readableSet
+}
+
+type readableSet struct {
+	domains [kv.DomainLen]bool
+	iis     map[kv.InvertedIdx]bool
+}
+
+// ErrDenied carries EIP-1474's "method not supported" code, so that a JSON-RPC caller can tell a
+// request this database cannot answer from a failure.
+var ErrDenied error = deniedError{}
+
+type deniedError struct{}
+
+func (deniedError) Error() string  { return "temporal: read denied" }
+func (deniedError) ErrorCode() int { return -32004 }
+
+// Restrict makes every read outside the given domains and inverted indices fail with ErrDenied. It
+// must be called before the DB is shared with readers.
+func (db *DB) Restrict(domains []kv.Domain, iis []kv.InvertedIdx) {
+	r := &readableSet{iis: make(map[kv.InvertedIdx]bool, len(iis))}
+	for _, d := range domains {
+		r.domains[d] = true
+	}
+	for _, ii := range iis {
+		r.iis[ii] = true
+	}
+	db.readable = r
+}
+
+func (db *DB) checkDomain(name kv.Domain) error {
+	if db.readable != nil && !db.readable.domains[name] {
+		return fmt.Errorf("%w: %s", ErrDenied, name)
+	}
+	return nil
+}
+
+func (db *DB) checkII(name kv.InvertedIdx) error {
+	if db.readable != nil && !db.readable.iis[name] {
+		return fmt.Errorf("%w: %s", ErrDenied, name)
+	}
+	return nil
 }
 
 // New wires the temporal DB over a raw kv.RwDB, its state aggregator, and the
@@ -583,6 +627,9 @@ func (tx *RwTx) Commit() error {
 }
 
 func (tx *tx) rangeAsOf(name kv.Domain, rtx kv.Tx, fromKey, toKey []byte, asOfTs uint64, asc order.By, limit int) (stream.KV, error) {
+	if denyErr := tx.db.checkDomain(name); denyErr != nil {
+		return nil, denyErr
+	}
 	it, err := tx.aggtx.RangeAsOf(tx.ctx, rtx, name, fromKey, toKey, asOfTs, asc, limit)
 	if err != nil {
 		return nil, err
@@ -599,6 +646,9 @@ func (tx *RwTx) RangeAsOf(name kv.Domain, fromKey, toKey []byte, asOfTs uint64, 
 }
 
 func (tx *tx) getLatest(name kv.Domain, dbTx kv.Tx, k []byte, opts kv.GetLatestOptions) (v []byte, step kv.Step, err error) {
+	if denyErr := tx.db.checkDomain(name); denyErr != nil {
+		return nil, 0, denyErr
+	}
 	v, step, ok, err := tx.aggtx.GetLatest(name, k, dbTx, opts)
 	if err != nil {
 		return nil, step, err
@@ -610,6 +660,9 @@ func (tx *tx) getLatest(name kv.Domain, dbTx kv.Tx, k []byte, opts kv.GetLatestO
 }
 
 func (tx *tx) getLatestValSize(name kv.Domain, dbTx kv.Tx, k []byte) (size int, found bool, err error) {
+	if denyErr := tx.db.checkDomain(name); denyErr != nil {
+		return 0, false, denyErr
+	}
 	return tx.aggtx.GetLatestValSize(name, k, dbTx)
 }
 
@@ -630,6 +683,9 @@ func (tx *RwTx) GetLatestValSize(name kv.Domain, k []byte) (size int, found bool
 }
 
 func (tx *tx) getAsOf(name kv.Domain, gtx kv.Tx, key []byte, ts uint64) (v []byte, ok bool, err error) {
+	if denyErr := tx.db.checkDomain(name); denyErr != nil {
+		return nil, false, denyErr
+	}
 	return tx.aggtx.GetAsOf(name, key, ts, gtx)
 }
 
@@ -642,6 +698,9 @@ func (tx *RwTx) GetAsOf(name kv.Domain, key []byte, ts uint64) (v []byte, ok boo
 }
 
 func (tx *tx) historySeek(name kv.Domain, dbTx kv.Tx, key []byte, ts uint64) (v []byte, ok bool, err error) {
+	if denyErr := tx.db.checkDomain(name); denyErr != nil {
+		return nil, false, denyErr
+	}
 	return tx.aggtx.HistorySeek(name, key, ts, dbTx)
 }
 
@@ -654,6 +713,9 @@ func (tx *RwTx) HistorySeek(name kv.Domain, key []byte, ts uint64) (v []byte, ok
 }
 
 func (tx *tx) indexRange(name kv.InvertedIdx, dbTx kv.Tx, k []byte, fromTs, toTs int, asc order.By, limit int) (timestamps stream.U64, err error) {
+	if denyErr := tx.db.checkII(name); denyErr != nil {
+		return nil, denyErr
+	}
 	timestamps, err = tx.aggtx.IndexRange(name, k, fromTs, toTs, asc, limit, dbTx)
 	if err != nil {
 		return nil, err
@@ -670,6 +732,9 @@ func (tx *RwTx) IndexRange(name kv.InvertedIdx, k []byte, fromTs, toTs int, asc 
 }
 
 func (tx *tx) historyRange(name kv.Domain, dbTx kv.Tx, fromTs, toTs int, asc order.By, limit int) (stream.KV, error) {
+	if denyErr := tx.db.checkDomain(name); denyErr != nil {
+		return nil, denyErr
+	}
 	it, err := tx.aggtx.HistoryRange(name, fromTs, toTs, asc, limit, dbTx)
 	if err != nil {
 		return nil, err
@@ -686,6 +751,9 @@ func (tx *RwTx) HistoryRange(name kv.Domain, fromTs, toTs int, asc order.By, lim
 }
 
 func (tx *tx) historyKeyTxNumRange(name kv.Domain, dbTx kv.Tx, fromTs, toTs int, asc order.By, limit int) (stream.KU64, error) {
+	if denyErr := tx.db.checkDomain(name); denyErr != nil {
+		return nil, denyErr
+	}
 	it, err := tx.aggtx.HistoryKeyTxNumRange(name, fromTs, toTs, asc, limit, dbTx)
 	if err != nil {
 		return nil, err
@@ -726,6 +794,9 @@ func (tx *RwTx) RangeLatest(domain kv.Domain, from, to []byte, limit int) (strea
 }
 
 func (tx *tx) rangeLatest(domain kv.Domain, dbTx kv.Tx, from, to []byte, limit int) (stream.KV, error) {
+	if denyErr := tx.db.checkDomain(domain); denyErr != nil {
+		return nil, denyErr
+	}
 	return tx.aggtx.DebugRangeLatest(dbTx, domain, from, to, limit)
 }
 
@@ -738,19 +809,32 @@ func (tx *RwTx) GetLatestFromDB(domain kv.Domain, k []byte) (v []byte, step kv.S
 }
 
 func (tx *RwTx) TraceKey(domain kv.Domain, k []byte, fromTxNum, toTxNum uint64) (stream.U64V, error) {
-	return tx.aggtx.DebugTraceKey(tx.ctx, domain, k, fromTxNum, toTxNum, tx.RwTx)
+	return tx.traceKey(domain, tx.RwTx, k, fromTxNum, toTxNum)
 }
 
 func (tx *tx) getLatestFromDB(domain kv.Domain, dbTx kv.Tx, k []byte) (v []byte, step kv.Step, found bool, err error) {
+	if denyErr := tx.db.checkDomain(domain); denyErr != nil {
+		return nil, 0, false, denyErr
+	}
 	return tx.aggtx.DebugGetLatestFromDB(domain, k, dbTx)
 }
 
 func (tx *tx) GetLatestFromFiles(domain kv.Domain, k []byte, maxTxNum uint64) (v []byte, found bool, fileStartTxNum uint64, fileEndTxNum uint64, err error) {
+	if denyErr := tx.db.checkDomain(domain); denyErr != nil {
+		return nil, false, 0, 0, denyErr
+	}
 	return tx.aggtx.DebugGetLatestFromFiles(domain, k, maxTxNum)
 }
 
 func (tx *Tx) TraceKey(domain kv.Domain, k []byte, fromTxNum, toTxNum uint64) (stream.U64V, error) {
-	return tx.aggtx.DebugTraceKey(tx.ctx, domain, k, fromTxNum, toTxNum, tx.Tx)
+	return tx.traceKey(domain, tx.Tx, k, fromTxNum, toTxNum)
+}
+
+func (tx *tx) traceKey(domain kv.Domain, dbTx kv.Tx, k []byte, fromTxNum, toTxNum uint64) (stream.U64V, error) {
+	if denyErr := tx.db.checkDomain(domain); denyErr != nil {
+		return nil, denyErr
+	}
+	return tx.aggtx.DebugTraceKey(tx.ctx, domain, k, fromTxNum, toTxNum, dbTx)
 }
 
 func (db *DB) DomainTables(domain ...kv.Domain) []string {

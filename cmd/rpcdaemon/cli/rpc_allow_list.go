@@ -22,11 +22,23 @@ import (
 	"os"
 	"strings"
 
+	"github.com/erigontech/erigon/cmd/rpcdaemon/cli/httpcfg"
 	"github.com/erigontech/erigon/rpc"
 )
 
 type allowListFile struct {
 	Allow rpc.AllowList `json:"allow"`
+}
+
+func allowListForRPC(cfg *httpcfg.HttpCfg) (rpc.AllowList, error) {
+	if !cfg.SnapshotOnly {
+		return parseAllowListForRPC(cfg.RpcAllowListFilePath)
+	}
+	list := make(rpc.AllowList, len(snapshotOnlyMethods))
+	for _, m := range snapshotOnlyMethods {
+		list[m] = struct{}{}
+	}
+	return list, nil
 }
 
 func parseAllowListForRPC(path string) (rpc.AllowList, error) {
