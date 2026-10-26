@@ -763,6 +763,18 @@ func (a *Aggregator) closeDirtyFiles() {
 
 func (a *Aggregator) EnableDomain(domain kv.Domain) { a.d[domain].Enabled = true }
 
+// DisableDomain makes the aggregator ignore a domain: it opens none of its files and builds none.
+func (a *Aggregator) DisableDomain(domain kv.Domain) { a.d[domain].Enabled = false }
+
+// DisableIdx is DisableDomain for a standalone index.
+func (a *Aggregator) DisableIdx(name kv.InvertedIdx) {
+	for _, ii := range a.standaloneIIs() {
+		if ii.Name == name {
+			ii.Enabled = false
+		}
+	}
+}
+
 func (a *Aggregator) setBuildAccessorsWorkers(i int) {
 	a.workers.trySet(func() {
 		for _, d := range a.d {
@@ -1648,6 +1660,7 @@ func (at *AggregatorRoTx) prune(ctx context.Context, tx kv.RwTx, limit uint64, a
 		defer logEvery.Stop()
 	}
 	aggStat := newAggregatorPruneStat()
+	holdsState := at.a.holdsState()
 	for id, d := range at.d {
 		//if _, ok := invalidateOnce[fmt.Sprintf("domain%s", d.d.ValuesTable)]; !ok {
 		//	if true { //d.d.Name != kv.CommitmentDomain {
@@ -1666,6 +1679,11 @@ func (at *AggregatorRoTx) prune(ctx context.Context, tx kv.RwTx, limit uint64, a
 		//		d.d.logger.Info("invalidated d&h prune progress", "name", d.name)
 		//	}
 		//}
+		// Without state, a disabled domain has nothing in the database, and pruning it would record
+		// progress past files it does not have.
+		if !d.d.Enabled && !holdsState {
+			continue
+		}
 		var err error
 		select {
 		case <-ctx.Done():
@@ -1680,6 +1698,9 @@ func (at *AggregatorRoTx) prune(ctx context.Context, tx kv.RwTx, limit uint64, a
 
 	stats := make([]*InvertedIndexPruneStat, at.iisCount)
 	for iikey := range stats {
+		if !at.iis[iikey].ii.Enabled && !holdsState {
+			continue
+		}
 		select {
 		case <-ctx.Done():
 			return aggStat, ctx.Err()
@@ -1702,7 +1723,9 @@ func (at *AggregatorRoTx) prune(ctx context.Context, tx kv.RwTx, limit uint64, a
 		stats[iikey] = stat
 	}
 	for iikey := range stats {
-		aggStat.Indices[at.iis[iikey].ii.FilenameBase] = stats[iikey]
+		if stats[iikey] != nil {
+			aggStat.Indices[at.iis[iikey].ii.FilenameBase] = stats[iikey]
+		}
 	}
 
 	return aggStat, nil
@@ -1866,7 +1889,7 @@ func (a *Aggregator) recalcVisibleFiles(retired retiredFiles) {
 		}
 		next.iis[id] = ii.calcVisibleFiles(toTxNum)
 	}
-	next.minimaxTxNum = next.stateMinimaxTxNum()
+	next.minimaxTxNum = a.minimaxTxNum(next)
 
 	if a.visibilityLoweringForbidden.Load() {
 		prev := a.visible.Load()
@@ -1898,6 +1921,40 @@ func (a *Aggregator) recalcVisibleFiles(retired retiredFiles) {
 	// `recalcVisibleFiles` is rare background operation under `dirtyFilesLock`
 	// it's good idea to delete files here, then hot reader-Close path will more likely be lock-free
 	reclaimFiles(a.reclaimRetiredLocked())
+}
+
+// holdsState is false for an aggregator with every state domain disabled, such as one only
+// building receipts.
+func (a *Aggregator) holdsState() bool {
+	for _, d := range kv.StateDomains {
+		if a.d[d].Enabled {
+			return true
+		}
+	}
+	return false
+}
+
+// minimaxTxNum is how far the files reach for merge and prune: the state domains, or without state
+// the domains and indexes the aggregator does hold.
+func (a *Aggregator) minimaxTxNum(v *aggregatorVisible) uint64 {
+	if a.holdsState() {
+		return v.stateMinimaxTxNum()
+	}
+	minTxNum := uint64(math.MaxUint64)
+	for id, d := range a.d {
+		if d != nil && d.Enabled && v.d[id] != nil {
+			minTxNum = min(minTxNum, visibleFiles(v.d[id].files).EndTxNum())
+		}
+	}
+	for id, ii := range a.standaloneIIs() {
+		if ii != nil && ii.Enabled && v.iis[id] != nil {
+			minTxNum = min(minTxNum, v.iis[id].files.EndTxNum())
+		}
+	}
+	if minTxNum == math.MaxUint64 {
+		return 0
+	}
+	return minTxNum
 }
 
 // stateMinimaxTxNum returns min(EndTxNum) across kv.StateDomains. Mirrors

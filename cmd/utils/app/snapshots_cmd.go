@@ -70,6 +70,7 @@ import (
 	"github.com/erigontech/erigon/db/rawdb/blockio"
 	"github.com/erigontech/erigon/db/recsplit"
 	"github.com/erigontech/erigon/db/seg"
+	"github.com/erigontech/erigon/db/snapcfg"
 	"github.com/erigontech/erigon/db/snapshotsync"
 	"github.com/erigontech/erigon/db/snapshotsync/blocksnapshots"
 	"github.com/erigontech/erigon/db/snapshotsync/caplinsnapschema"
@@ -81,6 +82,7 @@ import (
 	"github.com/erigontech/erigon/db/state/stats"
 	"github.com/erigontech/erigon/db/version"
 	"github.com/erigontech/erigon/diagnostics/mem"
+	chainspec "github.com/erigontech/erigon/execution/chain/spec"
 	"github.com/erigontech/erigon/execution/execfinality"
 	"github.com/erigontech/erigon/execution/stagedsync/stages"
 	"github.com/erigontech/erigon/execution/verify"
@@ -201,6 +203,24 @@ var snapshotCommand = cli.Command{
 			Flags: joinFlags([]cli.Flag{
 				&utils.DataDirFlag,
 				&utils.ErigondbDomainStepsInFrozenFileFlag,
+			}),
+		},
+		{
+			Name: "era-import",
+			Action: func(ctx context.Context, c *cli.Command) error {
+				dirs, l, err := datadir.New(c.String(utils.DataDirFlag.Name)).MustFlock()
+				if err != nil {
+					return err
+				}
+				defer unlockDatadir(log.Root(), l)
+
+				return doEraImport(ctx, c, dirs)
+			},
+			Usage: "build block segments, the receipt cache and the log indexes from era1 archive files",
+			Flags: joinFlags([]cli.Flag{
+				&utils.DataDirFlag,
+				&utils.ChainFlag,
+				&cli.StringFlag{Name: "era.dir", Usage: "directory holding the archive files; they continue where the segments already built leave off", Required: true},
 			}),
 		},
 		{
@@ -3446,6 +3466,55 @@ func doUnmerge(ctx context.Context, cliCtx *cli.Command, dirs datadir.Dirs) erro
 	}
 
 	return nil
+}
+
+// doEraImport turns a run of era1 archive files into epoch block segments.
+func doEraImport(ctx context.Context, cliCtx *cli.Command, dirs datadir.Dirs) error {
+	logger := log.Root()
+	defer logger.Info("Done")
+
+	spec, err := chainspec.ChainSpecByName(cliCtx.String(utils.ChainFlag.Name))
+	if err != nil {
+		return err
+	}
+	chainConfig, genesis := spec.Config, spec.GenesisHash
+
+	// A datadir that is already a node's says which chain it holds, and its own genesis is a better
+	// anchor than the one the chain name implies. A bare directory, which is what an operator
+	// producing segments without running a node has, carries neither.
+	if exists, err := dir2.FileExist(filepath.Join(dirs.Chaindata, "mdbx.dat")); err != nil {
+		return err
+	} else if exists {
+		db := dbCfg(dbcfg.ChainDB, dirs.Chaindata).MustOpen()
+		defer db.Close()
+		chainConfig = fromdb.ChainConfig(db)
+		if cliCtx.IsSet(utils.ChainFlag.Name) && chainConfig.ChainName != spec.Name {
+			return fmt.Errorf("--chain is %s but %s holds %s; segments for the two are named alike, so this has to be spelled out", spec.Name, dirs.Chaindata, chainConfig.ChainName)
+		}
+		if err := db.View(ctx, func(tx kv.Tx) error {
+			stored, err := rawdb.ReadCanonicalHash(tx, 0)
+			if err == nil && stored != (common.Hash{}) {
+				genesis = stored
+			}
+			return err
+		}); err != nil {
+			return err
+		}
+		// Same guard the other paths that write epoch segments use.
+		if err := freezeblocks.CheckLegacyDownloadFinished(db, dirs, chainConfig); err != nil {
+			return err
+		}
+	}
+
+	snCfg, known := snapcfg.KnownCfg(chainConfig.ChainName)
+	if !known {
+		return fmt.Errorf("no snapshot config for chain %q", chainConfig.ChainName)
+	}
+	eraDir := cliCtx.String("era.dir")
+	if err := freezeblocks.ImportEra(ctx, eraDir, dirs, chainConfig, snCfg, genesis, estimate.CompressSnapshot.Workers(), logger); err != nil {
+		return err
+	}
+	return freezeblocks.ImportEraReceipts(ctx, eraDir, dirs, chainConfig, logger)
 }
 
 func doRetireCommand(ctx context.Context, cliCtx *cli.Command, dirs datadir.Dirs) error {

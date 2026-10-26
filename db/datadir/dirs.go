@@ -124,6 +124,10 @@ func New(datadir string) Dirs {
 // absolute path stuff I don't want.
 const SnapDir = "snapshots"
 
+// EraReceipts returns where receipts and log indexes imported from era archives are kept: apart from
+// the node's own state, so that a node started on the datadir never sees them. Nothing is created.
+func (d Dirs) EraReceipts() Dirs { return Open(filepath.Join(d.DataDir, "era-receipts")) }
+
 // Open new Dirs instance without forcing all the directories to exist.
 func Open(datadir string) Dirs {
 	relativeDataDir := datadir
