@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime/debug"
 	"slices"
@@ -32,7 +33,6 @@ import (
 
 	"github.com/tidwall/btree"
 
-	"github.com/erigontech/erigon/cl/clparams"
 	"github.com/erigontech/erigon/cl/persistence/base_encoding"
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/common/background"
@@ -81,11 +81,10 @@ func BeaconSimpleIdx(ctx context.Context, sn snaptype.FileInfo, salt uint32, tmp
 func getKvGetterForStateTable(db kv.RoDB, tableName string) KeyValueGetter {
 	return func(numId uint64) ([]byte, []byte, error) {
 		var key, value []byte
-		var err error
 		if err := db.View(context.TODO(), func(tx kv.Tx) error {
 			key = base_encoding.Encode64ToBytes4(numId)
-			value, err = tx.GetOne(tableName, key)
-			value = bytes.Clone(value)
+			v, err := tx.GetOne(tableName, key)
+			value = bytes.Clone(v)
 			return err
 		}); err != nil {
 			return nil, nil, err
@@ -136,6 +135,9 @@ func MakeCaplinStateSnapshotsTypes(db kv.RoDB) SnapshotTypes {
 	}
 }
 
+// caplinDownloaderPrefix: the downloader is rooted at dirs.Snap, these live in dirs.SnapCaplin.
+const caplinDownloaderPrefix = "caplin"
+
 // value: chunked(ssz(SignedBeaconBlocks))
 // slot       -> beacon_slot_segment_offset
 
@@ -160,7 +162,7 @@ type SnapshotTypes struct {
 //   - all snapshots of given blocks range must exist - to make this blocks range available
 //   - gaps are not allowed
 //   - segment have [from:to) semantic
-func NewCaplinStateSnapshots(cfg ethconfig.BlocksFreezing, beaconCfg *clparams.BeaconChainConfig, dirs datadir.Dirs, snapshotTypes SnapshotTypes, logger log.Logger) *CaplinStateSnapshots {
+func NewCaplinStateSnapshots(cfg ethconfig.BlocksFreezing, dirs datadir.Dirs, snapshotTypes SnapshotTypes, logger log.Logger) *CaplinStateSnapshots {
 	if cfg.ChainName == "" {
 		log.Debug("[dbg] NewCaplinSnapshots created with empty ChainName", "stack", dbg.Stack())
 	}
@@ -229,11 +231,24 @@ func (s *CaplinStateSnapshots) Close() {
 	s.BaseRoSnapshots.Close()
 }
 
+// RemoveOverlaps re-keys the base's dir-relative names to what the downloader registered.
 func (s *CaplinStateSnapshots) RemoveOverlaps(onDelete func(l []string) error) error {
 	if s == nil {
 		return nil
 	}
+	if onDelete != nil {
+		notify := onDelete
+		onDelete = func(l []string) error { return notify(downloaderKeys(l)) }
+	}
 	return s.BaseRoSnapshots.RemoveOverlaps(onDelete)
+}
+
+func downloaderKeys(names []string) []string {
+	keys := make([]string, len(names))
+	for i, name := range names {
+		keys[i] = path.Join(caplinDownloaderPrefix, filepath.ToSlash(name))
+	}
+	return keys
 }
 
 func (s *CaplinStateSnapshots) IndicesMax() uint64 {
@@ -489,7 +504,7 @@ func caplinStateFileName(snapName string, fromSlot, toSlot uint64) (string, erro
 	if typ == nil {
 		return "", fmt.Errorf("unknown caplin state snapshot type %q", snapName)
 	}
-	return typ.FileName(version.ZeroVersion, fromSlot, toSlot), nil
+	return typ.FileName(version.ZeroVersion, false, fromSlot, toSlot), nil
 }
 
 type caplinStateDumpJob struct {
@@ -541,6 +556,8 @@ func planStateDump(coverage map[string][]Range, toSlot, blocksPerFile uint64) []
 	return jobs
 }
 
+// DumpCaplinState must not run concurrently with RemoveOverlaps, which sweeps its own .tmp files in
+// the output directory. Both run on loopStates; parallelising the dump breaks that.
 func (s *CaplinStateSnapshots) DumpCaplinState(ctx context.Context, toSlot, blocksPerFile uint64, salt uint32, dirs datadir.Dirs, workers int, lvl log.Lvl, logger log.Logger) error {
 	coverage := make(map[string][]Range, len(s.snapshotTypes.KeyValueGetters))
 	for name := range s.snapshotTypes.KeyValueGetters {
@@ -590,7 +607,7 @@ func (s *CaplinStateSnapshots) BuildMissingIndices(ctx context.Context, logger l
 				return fmt.Errorf("invalid caplin state snapshot filename %q", df.FileName())
 			}
 
-			indexFile := filepath.Join(sn.Dir(), snaptype.IdxFileName(sn.Version, sn.From, sn.To, sn.CaplinTypeString))
+			indexFile := filepath.Join(sn.Dir(), snaptype.IdxFileName(sn.Version, false, sn.From, sn.To, sn.CaplinTypeString))
 			if _, err := os.Stat(indexFile); err == nil {
 				logger.Info("index file already exists, yet dirtyFile didn't have it opened", "seg", sn.Name())
 				continue

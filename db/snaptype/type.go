@@ -40,8 +40,10 @@ import (
 	"github.com/erigontech/erigon/execution/chain"
 )
 
-type Version = version.Version
-type Versions = version.Versions
+type (
+	Version  = version.Version
+	Versions = version.Versions
+)
 
 type FirstKeyGetter func(ctx context.Context) uint64
 
@@ -69,8 +71,10 @@ func (f IndexBuilderFunc) Build(ctx context.Context, info FileInfo, salt uint32,
 	return f(ctx, info, salt, chainConfig, tmpDir, p, lvl, logger)
 }
 
-var saltMap = map[string]uint32{}
-var saltLock sync.RWMutex
+var (
+	saltMap  = map[string]uint32{}
+	saltLock sync.RWMutex
+)
 
 func LoadSalt(baseDir string, autoCreate bool, logger log.Logger) (*uint32, error) {
 	// issue: https://github.com/erigontech/erigon/issues/14300
@@ -83,6 +87,18 @@ func LoadSalt(baseDir string, autoCreate bool, logger log.Logger) (*uint32, erro
 		return nil, err
 	}
 
+	var saltBytes []byte
+	if exists {
+		if saltBytes, err = os.ReadFile(fpath); err != nil {
+			return nil, err
+		}
+		// WriteFileWithFsync truncates before writing, so an interrupted write leaves a
+		// wrong-sized file behind. It carries no usable salt, so treat it as missing.
+		if exists = len(saltBytes) == 4; !exists {
+			logger.Warn("discarding malformed snaptype salt file, accessors built under the previous salt no longer match", "file", fpath, "len", len(saltBytes))
+		}
+	}
+
 	if !exists {
 		if !autoCreate {
 			logger.Debug("snaptype salt file not found + autocreate disabled")
@@ -90,20 +106,7 @@ func LoadSalt(baseDir string, autoCreate bool, logger log.Logger) (*uint32, erro
 		}
 		dir.MustExist(baseDir)
 
-		saltBytes := make([]byte, 4)
-		binary.BigEndian.PutUint32(saltBytes, randUint32())
-		if err := dir.WriteFileWithFsync(fpath, saltBytes, os.ModePerm); err != nil {
-			return nil, err
-		}
-	}
-	saltBytes, err := os.ReadFile(fpath)
-	if err != nil {
-		return nil, err
-	}
-	if len(saltBytes) != 4 {
-		dir.MustExist(baseDir)
-
-		saltBytes := make([]byte, 4)
+		saltBytes = make([]byte, 4)
 		binary.BigEndian.PutUint32(saltBytes, randUint32())
 		if err := dir.WriteFileWithFsync(fpath, saltBytes, os.ModePerm); err != nil {
 			return nil, err
@@ -112,7 +115,6 @@ func LoadSalt(baseDir string, autoCreate bool, logger log.Logger) (*uint32, erro
 
 	salt := binary.BigEndian.Uint32(saltBytes)
 	return &salt, nil
-
 }
 
 // GetIndicesSalt - try read salt for all indices from DB. Or fall-back to new salt creation.
@@ -172,7 +174,7 @@ func (i Index) HasFile(info FileInfo, dirEntries []string, logger log.Logger) bo
 		return false
 	}
 
-	fNameMask := IdxFileMask(info.From, info.To, i.Name)
+	fNameMask := IdxFileMask(info.Epoch, info.From, info.To, i.Name)
 	fPath, fileVer, ok, err := version.MatchVersionedFile(fNameMask, dirEntries, dir)
 	if err != nil {
 		logger.Debug("[ind] HasFile: files by pattern didn't found", "f", fNameMask, "dir", dir, "err", err)
@@ -195,7 +197,6 @@ func (i Index) HasFile(info FileInfo, dirEntries []string, logger log.Logger) bo
 	}
 
 	idx, err := recsplit.OpenIndex(fPath)
-
 	if err != nil {
 		logger.Debug("[ind] HasFile: opening index", "path", fPath, "err", err)
 		return false
@@ -209,11 +210,11 @@ type Type interface {
 	Enum() Enum
 	Versions() Versions
 	Name() string
-	FileName(version Version, from uint64, to uint64) string
-	FileInfo(dir string, from uint64, to uint64) FileInfo
-	FileInfoByMask(dir string, from uint64, to uint64) FileInfo
-	IdxFileName(version Version, from uint64, to uint64, index ...Index) string
-	IdxFileNames(from uint64, to uint64) []string
+	FileName(version Version, epoch bool, from uint64, to uint64) string
+	FileInfo(dir string, epoch bool, from, to uint64) FileInfo
+	FileInfoByMask(dir string, epoch bool, from uint64, to uint64) FileInfo
+	IdxFileName(version Version, epoch bool, from uint64, to uint64, index ...Index) string
+	IdxFileNames(epoch bool, from uint64, to uint64) []string
 	Indexes() []Index
 	HasIndexFiles(info FileInfo, dirEntries []string, logger log.Logger) bool
 	BuildIndexes(ctx context.Context, info FileInfo, indexBuilder IndexBuilder, chainConfig *chain.Config, tmpDir string, p *background.Progress, lvl log.Lvl, logger log.Logger) error
@@ -234,8 +235,10 @@ type SnapType struct {
 // These are raw maps with no mutex protection becuase they are
 // expected to be written to once during program initialization
 // and them be readonly
-var registeredTypes = map[Enum]Type{}
-var namedTypes = map[string]Type{}
+var (
+	registeredTypes = map[Enum]Type{}
+	namedTypes      = map[string]Type{}
+)
 
 func RegisterType(enum Enum, name string, versions Versions, rangeExtractor RangeExtractor, indexes []Index, indexBuilder IndexBuilder) Type {
 	if enum >= MinCaplinEnum && enum < MaxCaplinEnum {
@@ -300,27 +303,27 @@ func (s SnapType) RangeExtractor() RangeExtractor {
 	return s.rangeExtractor
 }
 
-func (s SnapType) FileName(version Version, from uint64, to uint64) string {
+func (s SnapType) FileName(version Version, epoch bool, from uint64, to uint64) string {
 	if version.Major == 0 && version.Minor == 0 {
 		version = s.versions.Current
 	}
 
-	return SegmentFileName(version, from, to, s.enum)
+	return SegmentFileName(version, epoch, from, to, s.enum)
 }
 
-func (s SnapType) FileMask(from uint64, to uint64) string {
-	return SegmentFileMask(from, to, s.enum)
+func (s SnapType) FileMask(epoch bool, from uint64, to uint64) string {
+	return SegmentFileMask(epoch, from, to, s.enum)
 }
 
-func (s SnapType) FileInfo(dir string, from uint64, to uint64) FileInfo {
-	f, _, _ := ParseFileName(dir, s.FileName(s.versions.Current, from, to))
+func (s SnapType) FileInfo(dir string, epoch bool, from, to uint64) FileInfo {
+	f, _, _ := ParseFileName(dir, s.FileName(s.versions.Current, epoch, from, to))
 	return f
 }
 
-func (s SnapType) FileInfoByMask(dir string, from uint64, to uint64) FileInfo {
-	fName, _, ok, err := version.FindFilesWithVersionsByPattern(filepath.Join(dir, s.FileMask(from, to)))
+func (s SnapType) FileInfoByMask(dir string, epoch bool, from uint64, to uint64) FileInfo {
+	fName, _, ok, err := version.FindFilesWithVersionsByPattern(filepath.Join(dir, s.FileMask(epoch, from, to)))
 	if err != nil {
-		log.Debug("[snaptype] file mask error", "err", err, "fName", s.FileName(s.versions.Current, from, to))
+		log.Debug("[snaptype] file mask error", "err", err, "fName", s.FileName(s.versions.Current, epoch, from, to))
 		return FileInfo{}
 	}
 	if !ok {
@@ -344,7 +347,6 @@ func (s SnapType) Indexes() []Index {
 
 func (s SnapType) BuildIndexes(ctx context.Context, info FileInfo, indexBuilder IndexBuilder, chainConfig *chain.Config, tmpDir string, p *background.Progress, lvl log.Lvl, logger log.Logger) error {
 	salt, err := GetIndexSalt(info.Dir(), logger)
-
 	if err != nil {
 		return err
 	}
@@ -366,16 +368,16 @@ func (s SnapType) HasIndexFiles(info FileInfo, dirEntries []string, logger log.L
 	return true
 }
 
-func (s SnapType) IdxFileNames(from uint64, to uint64) []string {
+func (s SnapType) IdxFileNames(epoch bool, from uint64, to uint64) []string {
 	fileNames := make([]string, len(s.indexes))
 	for i, index := range s.indexes {
-		fileNames[i] = IdxFileName(index.Version.Current, from, to, index.Name)
+		fileNames[i] = IdxFileName(index.Version.Current, epoch, from, to, index.Name)
 	}
 
 	return fileNames
 }
 
-func (s SnapType) IdxFileName(ver version.Version, from uint64, to uint64, index ...Index) string {
+func (s SnapType) IdxFileName(ver version.Version, epoch bool, from uint64, to uint64, index ...Index) string {
 	if len(index) == 0 {
 		if len(s.indexes) == 0 {
 			return ""
@@ -391,7 +393,7 @@ func (s SnapType) IdxFileName(ver version.Version, from uint64, to uint64, index
 		}
 	}
 
-	return IdxFileName(ver, from, to, index[0].Name)
+	return IdxFileName(ver, epoch, from, to, index[0].Name)
 }
 
 func ParseFileType(s string) (Type, bool) {
@@ -412,9 +414,11 @@ type Enums struct {
 	Unknown Enum
 }
 
-const MinCoreEnum = 1
-const MaxCaplinEnum = 50 // exclusive upper bound of the caplin enum range
-const MinCaplinEnum = 10
+const (
+	MinCoreEnum   = 1
+	MaxCaplinEnum = 50 // exclusive upper bound of the caplin enum range
+	MinCaplinEnum = 10
+)
 
 // MinCaplinStateEnum is the first beacon-state type; BeaconBlocks and BlobSidecars occupy
 // the two slots below it, so a new caplin block type must go here, not at a free tail slot.
@@ -432,25 +436,24 @@ var CaplinEnums = struct {
 	BlobSidecars: MinCaplinEnum + 1,
 }
 
-func (ft Enum) String() string {
-	if t, ok := registeredTypes[ft]; ok {
+func (e Enum) String() string {
+	if t, ok := registeredTypes[e]; ok {
 		return t.Name()
 	}
 
-	panic(fmt.Sprintf("unknown file type: %d", ft))
+	panic(fmt.Sprintf("unknown file type: %d", e))
 }
 
-func (ft Enum) Type() Type {
-	return registeredTypes[ft]
+func (e Enum) Type() Type {
+	return registeredTypes[e]
 }
 
-func (e Enum) FileName(from uint64, to uint64) string {
-	return SegmentFileName(e.Type().Versions().Current, from, to, e)
+func (e Enum) FileName(epoch bool, from uint64, to uint64) string {
+	return SegmentFileName(e.Type().Versions().Current, epoch, from, to, e)
 }
 
-func (e Enum) FileInfo(dir string, from uint64, to uint64) FileInfo {
-	f, _, _ := ParseFileName(dir, e.FileName(from, to))
-	return f
+func (e Enum) FileInfo(dir string, epoch bool, from, to uint64) FileInfo {
+	return e.Type().FileInfo(dir, epoch, from, to)
 }
 
 func (e Enum) HasIndexFiles(info FileInfo, dirEntries []string, logger log.Logger) bool {
@@ -501,7 +504,7 @@ func BuildIndex(ctx context.Context, info FileInfo, indexVersion version.Version
 
 	cfg.KeyCount = d.Count()
 	idxVer := indexVersion.Current
-	cfg.IndexFile = filepath.Join(info.Dir(), info.Type.IdxFileName(idxVer, info.From, info.To))
+	cfg.IndexFile = filepath.Join(info.Dir(), info.Type.IdxFileName(idxVer, info.Epoch, info.From, info.To))
 	versionOfRs := version.DataStructureVersion(0)
 	if !idxVer.Eq(version.V1_0) { // inner version=1 incompatible with .efi v1.0
 		versionOfRs = recsplit.ExistenceFilterVersion
@@ -540,7 +543,9 @@ func BuildIndex(ctx context.Context, info FileInfo, indexVersion version.Version
 		if err = rs.Build(ctx); err != nil {
 			if errors.Is(err, recsplit.ErrCollision) {
 				logger.Info("Building recsplit. Collision happened. It's ok. Restarting with another salt...", "err", err)
-				rs.ResetNextSalt()
+				if err := rs.ResetNextSalt(); err != nil {
+					return err
+				}
 				continue
 			}
 			return err
@@ -564,7 +569,7 @@ func BuildIndexWithSnapName(ctx context.Context, info FileInfo, cfg recsplit.Rec
 	defer d.Close()
 
 	cfg.KeyCount = d.Count()
-	cfg.IndexFile = filepath.Join(info.Dir(), IdxFileName(info.Version, info.From, info.To, info.CaplinTypeString))
+	cfg.IndexFile = filepath.Join(info.Dir(), IdxFileName(info.Version, info.Epoch, info.From, info.To, info.CaplinTypeString))
 	rs, err := recsplit.NewRecSplit(cfg, logger)
 	if err != nil {
 		return err
@@ -598,7 +603,9 @@ func BuildIndexWithSnapName(ctx context.Context, info FileInfo, cfg recsplit.Rec
 		if err = rs.Build(ctx); err != nil {
 			if errors.Is(err, recsplit.ErrCollision) {
 				logger.Info("Building recsplit. Collision happened. It's ok. Restarting with another salt...", "err", err)
-				rs.ResetNextSalt()
+				if err := rs.ResetNextSalt(); err != nil {
+					return err
+				}
 				continue
 			}
 			return err
@@ -612,7 +619,6 @@ func ExtractRange(ctx context.Context, f FileInfo, extractor RangeExtractor, ind
 	var lastKeyValue uint64
 
 	sn, err := seg.NewCompressor(ctx, "Snapshot "+f.Type.Name(), f.Path, tmpDir, seg.DefaultCfg, lvl, logger)
-
 	if err != nil {
 		return lastKeyValue, err
 	}
@@ -621,7 +627,6 @@ func ExtractRange(ctx context.Context, f FileInfo, extractor RangeExtractor, ind
 	lastKeyValue, err = extractor.Extract(ctx, f.From, f.To, firstKey, chainDB, chainConfig, func(v []byte) error {
 		return sn.AddWord(v)
 	}, workers, lvl, logger, hashResolver)
-
 	if err != nil {
 		return lastKeyValue, fmt.Errorf("ExtractRange: %w", err)
 	}

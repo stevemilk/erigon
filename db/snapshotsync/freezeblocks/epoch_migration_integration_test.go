@@ -1,0 +1,489 @@
+// Copyright 2026 The Erigon Authors
+// This file is part of Erigon.
+//
+// Erigon is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// Erigon is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with Erigon. If not, see <http://www.gnu.org/licenses/>.
+
+package freezeblocks_test
+
+import (
+	"bytes"
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/erigontech/erigon/common/dir"
+	"github.com/erigontech/erigon/common/hexutil"
+	"github.com/erigontech/erigon/common/log/v3"
+	"github.com/erigontech/erigon/db/datadir"
+	"github.com/erigontech/erigon/db/kv"
+	"github.com/erigontech/erigon/db/kv/dbutils"
+	"github.com/erigontech/erigon/db/rawdb"
+	"github.com/erigontech/erigon/db/seg"
+	"github.com/erigontech/erigon/db/snapshotsync/freezeblocks"
+	"github.com/erigontech/erigon/db/snaptype"
+	"github.com/erigontech/erigon/db/snaptype2"
+	"github.com/erigontech/erigon/db/version"
+	"github.com/erigontech/erigon/execution/chain"
+	"github.com/erigontech/erigon/execution/execmodule/execmoduletester"
+	"github.com/erigontech/erigon/execution/rlp"
+	"github.com/erigontech/erigon/execution/types"
+)
+
+const (
+	migrationChainSize = 3000 // split into decimal segments [0,1000),[1000,2000),[2000,3000)
+	migrationTailFrom  = 2048 // floor(3000, 1024); epoch tiles [0,1024),[1024,2048), tail [2048,3000)
+	migrationTailBlock = 2500 // a block inside the tail [2048,3000), used to prove tail writes
+)
+
+// decimalBounds are the 1000-aligned block boundaries the fixture splits the decimal data at, so the
+// migration reads across several segments and its per-segment deletion advances over more than one.
+// The segment holding migrationTailFrom ([2000,3000)) is the straddle; the two below it get deleted
+// during the produce phase, and [2000,3000) survives to the final cleanup.
+var decimalBounds = []uint64{0, 1000, 2000, migrationChainSize}
+
+// dumpDecimalSeg dumps the real block data for [from,to) into a v1 (decimal-named) segment of typ,
+// giving the migration authentic decimal input to convert. firstTxNum seeds the BaseTxnID for a
+// bodies segment (ignored by the other types); it returns the last txn id used so a caller can chain
+// firstTxNum across consecutive bodies segments.
+func dumpDecimalSeg(t *testing.T, m *migrationFixture, from, to uint64, typ snaptype.Type, firstTxNum uint64, logger log.Logger) (lastTxNum uint64) {
+	t.Helper()
+	cfg := freezeblocks.BlockCompressCfg
+	cfg.Workers = 1
+	path := filepath.Join(m.dirs.Snap, snaptype.SegmentFileName(version.V1_0, false, from, to, typ.Enum()))
+	c, err := seg.NewCompressor(m.Ctx, "test-decimal", path, m.dirs.Tmp, cfg, log.LvlDebug, logger)
+	require.NoError(t, err)
+	defer c.Close()
+	c.DisableFsync()
+	collect := func(v []byte) error { return c.AddWord(v) }
+	switch typ.Enum() {
+	case snaptype2.Headers.Enum():
+		_, err = freezeblocks.DumpHeadersRaw(m.Ctx, m.DB, from, to, collect, log.LvlDebug, logger, true)
+	case snaptype2.Bodies.Enum():
+		lastTxNum, err = freezeblocks.DumpBodies(m.Ctx, m.DB, m.ChainConfig, from, to, func(context.Context) uint64 { return firstTxNum }, collect, 1, log.LvlDebug, logger)
+	case snaptype2.Transactions.Enum():
+		_, err = freezeblocks.DumpTxs(m.Ctx, m.DB, m.ChainConfig, from, to, nil, collect, 1, log.LvlDebug, logger)
+	}
+	require.NoError(t, err)
+	require.NoError(t, c.Compress())
+	return lastTxNum
+}
+
+// dumpAllDecimal writes the decimal segments for [0,migrationChainSize), split at decimalBounds, for
+// all three block types. Bodies chain firstTxNum across segments so BaseTxnID stays cumulative.
+func dumpAllDecimal(t *testing.T, m *migrationFixture, logger log.Logger) {
+	t.Helper()
+	for i := 0; i+1 < len(decimalBounds); i++ {
+		dumpDecimalSeg(t, m, decimalBounds[i], decimalBounds[i+1], snaptype2.Headers, 0, logger)
+		dumpDecimalSeg(t, m, decimalBounds[i], decimalBounds[i+1], snaptype2.Transactions, 0, logger)
+	}
+	// DumpBodies returns the next block's BaseTxnID (it advances past the trailing system tx), so the
+	// next segment continues from exactly that value — no extra +1.
+	var firstTxNum uint64
+	for i := 0; i+1 < len(decimalBounds); i++ {
+		firstTxNum = dumpDecimalSeg(t, m, decimalBounds[i], decimalBounds[i+1], snaptype2.Bodies, firstTxNum, logger)
+	}
+}
+
+// migrationFixture is a chain in the tester's DB plus a snapshots directory of its own. The tester
+// retires blocks into its own datadir in the background and keeps those files open, so converting
+// there races with it, and on Windows an open file can be neither replaced nor deleted.
+type migrationFixture struct {
+	*execmoduletester.ExecModuleTester
+	dirs datadir.Dirs
+}
+
+func newMigrationFixture(t *testing.T, logger log.Logger) *migrationFixture {
+	t.Helper()
+	m := &migrationFixture{
+		ExecModuleTester: createDumpTestKV(t, chain.AllProtocolChanges, migrationChainSize),
+		dirs:             datadir.New(t.TempDir()),
+	}
+	_, err := snaptype.LoadSalt(m.dirs.Snap, true, logger)
+	require.NoError(t, err)
+	return m
+}
+
+func migrate(t *testing.T, m *migrationFixture, logger log.Logger) error {
+	t.Helper()
+	return freezeblocks.MigrateDecimalToEpoch(m.Ctx, m.dirs, m.DB, m.ChainConfig, 1, logger)
+}
+
+// headerInDB reports whether block n's header is present in the DB.
+func headerInDB(t *testing.T, m *migrationFixture, n uint64) bool {
+	t.Helper()
+	var present bool
+	require.NoError(t, m.DB.View(m.Ctx, func(tx kv.Tx) error {
+		present = rawdb.ReadHeaderByNumber(tx, n) != nil
+		return nil
+	}))
+	return present
+}
+
+// dropHeader deletes block n's header from the DB, simulating a tail block whose write-back has not
+// been committed yet.
+func dropHeader(t *testing.T, m *migrationFixture, n uint64) {
+	t.Helper()
+	require.NoError(t, m.DB.Update(m.Ctx, func(tx kv.RwTx) error {
+		h := rawdb.ReadHeaderByNumber(tx, n)
+		require.NotNil(t, h)
+		return tx.Delete(kv.Headers, dbutils.HeaderKey(n, h.Hash()))
+	}))
+}
+
+// requireEpochOnly asserts a single epoch-only regime: the first epoch tier [0,1024) is present for
+// every block type, and none of the decimal segments remain on disk.
+func requireEpochOnly(t *testing.T, m *migrationFixture) {
+	t.Helper()
+	for _, typ := range snaptype2.BlockSnapshotTypes {
+		require.FileExists(t, filepath.Join(m.dirs.Snap, typ.FileInfo(m.dirs.Snap, true, 0, 1024).Name()), typ.Name())
+		for i := 0; i+1 < len(decimalBounds); i++ {
+			require.NoFileExists(t, filepath.Join(m.dirs.Snap, snaptype.SegmentFileName(version.V1_0, false, decimalBounds[i], decimalBounds[i+1], typ.Enum())), typ.Name())
+		}
+	}
+}
+
+// setupMigrated builds a chain, dumps it as decimal, and runs one full migration, leaving the datadir
+// in the completed state: epoch [0,1024),[1024,2048) + indexes, decimal deleted, tail [2048,3000) in DB.
+func setupMigrated(t *testing.T, logger log.Logger) *migrationFixture {
+	t.Helper()
+	m := newMigrationFixture(t, logger)
+	dumpAllDecimal(t, m, logger)
+	require.NoError(t, migrate(t, m, logger))
+	return m
+}
+
+// TestMigrateDecimalToEpoch is the happy path: a fresh datadir of decimal segments is converted to
+// epoch [0,1024),[1024,2048) with indexes, the sub-1024 tail [2048,3000) is written back to the DB,
+// the decimal segments are deleted, and a second run is a no-op.
+func TestMigrateDecimalToEpoch(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+	logger := log.New()
+	m := newMigrationFixture(t, logger)
+	dumpAllDecimal(t, m, logger)
+
+	// Drop a tail block first so we can prove the migration actually writes the tail back.
+	dropHeader(t, m, migrationTailBlock)
+	require.False(t, headerInDB(t, m, migrationTailBlock))
+
+	require.NoError(t, migrate(t, m, logger))
+
+	// The first epoch tier [0,1024) exists with indexes for all three block types; decimal ones gone.
+	requireEpochOnly(t, m)
+	for _, typ := range snaptype2.BlockSnapshotTypes {
+		for _, idxName := range typ.IdxFileNames(true, 0, 1024) {
+			require.FileExists(t, filepath.Join(m.dirs.Snap, idxName), idxName)
+		}
+	}
+
+	// Epoch header segment content is correct: word K decodes to header number K.
+	d, err := seg.NewDecompressor(filepath.Join(m.dirs.Snap, snaptype2.Headers.FileInfo(m.dirs.Snap, true, 0, 1024).Name()))
+	require.NoError(t, err)
+	defer d.Close()
+	require.Equal(t, 1024, d.Count())
+	g := d.MakeGetter()
+	for k := uint64(0); g.HasNext(); k++ {
+		w, _ := g.Next(nil)
+		var h types.Header
+		require.NoError(t, rlp.DecodeBytes(w[1:], &h))
+		require.Equal(t, k, h.Number.Uint64())
+	}
+
+	// The tail block was written back to the DB.
+	require.True(t, headerInDB(t, m, migrationTailBlock))
+
+	// Idempotent: a second run finds no decimal and is a no-op.
+	require.NoError(t, migrate(t, m, logger))
+	requireEpochOnly(t, m)
+}
+
+// TestEpochMigration_TailDurableBeforeIndexes pins the write order: the DB tail is committed before
+// the epoch indexes are built, so a crash during index building (the longest, most memory-hungry
+// phase) leaves the tail already durable instead of forcing it to be re-collected. Index building is
+// made to fail by pointing the migration at an unusable tmp dir, which nothing before it needs on a
+// resume — the epoch segments already exist, so no compressor runs.
+func TestEpochMigration_TailDurableBeforeIndexes(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+	logger := log.New()
+	m := setupMigrated(t, logger)
+
+	dumpAllDecimal(t, m, logger)
+	dropHeader(t, m, migrationTailBlock)
+	require.False(t, headerInDB(t, m, migrationTailBlock))
+
+	// force the index step to run (and then fail): drop the headers index, and make tmp unusable.
+	headersIdx := snaptype2.Headers.IdxFileNames(true, 0, 1024)[0]
+	require.NoError(t, dir.RemoveFile(filepath.Join(m.dirs.Snap, headersIdx)))
+	brokenTmp := filepath.Join(t.TempDir(), "not-a-dir")
+	require.NoError(t, os.WriteFile(brokenTmp, nil, 0o644))
+	dirs := m.dirs
+	dirs.Tmp = brokenTmp
+
+	require.Error(t, freezeblocks.MigrateDecimalToEpoch(m.Ctx, dirs, m.DB, m.ChainConfig, 1, logger))
+
+	require.True(t, headerInDB(t, m, migrationTailBlock),
+		"tail must be committed before the indexes are built")
+	require.NoFileExists(t, filepath.Join(m.dirs.Snap, headersIdx))
+
+	// That failure leaves a state this ordering newly makes possible — tail committed, an index
+	// missing, straddles still on disk. A resume has to converge from it.
+	require.NoError(t, migrate(t, m, logger))
+	require.FileExists(t, filepath.Join(m.dirs.Snap, headersIdx))
+	require.True(t, headerInDB(t, m, migrationTailBlock))
+	requireEpochOnly(t, m)
+}
+
+// dumpDecimalTypes writes decimal segments of the given types split at bounds, chaining BaseTxnID
+// across bodies segments from block 0 so that any subset of ranges stays numbered as the chain is.
+func dumpDecimalTypes(t *testing.T, m *migrationFixture, bounds []uint64, logger log.Logger, types ...snaptype.Type) {
+	t.Helper()
+	for _, typ := range types {
+		var firstTxNum uint64
+		if typ.Enum() == snaptype2.Bodies.Enum() && bounds[0] > 0 {
+			firstTxNum = dumpDecimalSeg(t, m, 0, bounds[0], typ, 0, logger)
+			require.NoError(t, dir.RemoveFile(filepath.Join(m.dirs.Snap, snaptype.SegmentFileName(version.V1_0, false, 0, bounds[0], typ.Enum()))))
+		}
+		for i := 0; i+1 < len(bounds); i++ {
+			firstTxNum = dumpDecimalSeg(t, m, bounds[i], bounds[i+1], typ, firstTxNum, logger)
+		}
+	}
+}
+
+func decimalSegsLeft(t *testing.T, m *migrationFixture) bool {
+	t.Helper()
+	left, err := freezeblocks.HasDecimalBlockSegments(m.dirs, m.ChainConfig)
+	require.NoError(t, err)
+	return left
+}
+
+// A type whose segments start inside the last full epoch segment would come out with none at all,
+// and the visible-file calculation then hides every other type too. Refuse before touching anything.
+func TestEpochMigration_RefusesToLeaveATypeWithoutSegments(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+	logger := log.New()
+	m := newMigrationFixture(t, logger)
+	dumpDecimalTypes(t, m, decimalBounds, logger, snaptype2.Headers, snaptype2.Bodies)
+	dumpDecimalTypes(t, m, []uint64{2000, 3000}, logger, snaptype2.Transactions)
+	before, err := os.ReadDir(m.dirs.Snap)
+	require.NoError(t, err)
+
+	require.ErrorContains(t, migrate(t, m, logger), "transactions")
+
+	after, err := os.ReadDir(m.dirs.Snap)
+	require.NoError(t, err)
+	require.Equal(t, len(before), len(after), "nothing is converted or deleted")
+	require.True(t, decimalSegsLeft(t, m))
+}
+
+// shiftDBTxnIDs moves every DB body's transactions d ids up, the state a node is left in once the
+// EthTx sequence has handed ids to bodies that never became canonical.
+func shiftDBTxnIDs(t *testing.T, m *migrationFixture, d uint64) {
+	t.Helper()
+	type stored struct {
+		key  []byte
+		body types.BodyForStorage
+		txs  [][]byte
+	}
+	require.NoError(t, m.DB.Update(m.Ctx, func(tx kv.RwTx) error {
+		var all []stored
+		if err := tx.ForEach(kv.BlockBody, nil, func(k, v []byte) error {
+			s := stored{key: bytes.Clone(k)}
+			if err := rlp.DecodeBytes(v, &s.body); err != nil {
+				return err
+			}
+			if s.body.TxCount > 2 {
+				if err := tx.ForAmount(kv.EthTx, hexutil.EncodeTs(s.body.BaseTxnID.At(0)), s.body.TxCount-2, func(_, v []byte) error {
+					s.txs = append(s.txs, bytes.Clone(v))
+					return nil
+				}); err != nil {
+					return err
+				}
+			}
+			all = append(all, s)
+			return nil
+		}); err != nil {
+			return err
+		}
+		if err := tx.ClearTable(kv.EthTx); err != nil {
+			return err
+		}
+		for _, s := range all {
+			s.body.BaseTxnID += types.BaseTxnID(d)
+			v, err := rlp.EncodeToBytes(&s.body)
+			if err != nil {
+				return err
+			}
+			if err := tx.Put(kv.BlockBody, s.key, v); err != nil {
+				return err
+			}
+			for i, txn := range s.txs {
+				if err := tx.Put(kv.EthTx, hexutil.EncodeTs(s.body.BaseTxnID.At(i)), txn); err != nil {
+					return err
+				}
+			}
+		}
+		_, err := tx.IncrementSequence(kv.EthTx, d)
+		return err
+	}))
+}
+
+// readTailTxs returns the transactions stored at each tail block's own txn ids. It reads every id
+// on its own: a range read skips a missing id and returns the next stored transaction instead.
+func readTailTxs(t *testing.T, m *migrationFixture) map[uint64][][]byte {
+	t.Helper()
+	res := make(map[uint64][][]byte)
+	require.NoError(t, m.DB.View(m.Ctx, func(tx kv.Tx) error {
+		for n := uint64(migrationTailFrom); n < migrationChainSize; n++ {
+			hash, err := rawdb.ReadCanonicalHash(tx, n)
+			if err != nil {
+				return err
+			}
+			body, err := rawdb.ReadBodyForStorageByKey(tx, dbutils.BlockBodyKey(n, hash))
+			if err != nil {
+				return err
+			}
+			require.NotNil(t, body, "block %d", n)
+			txs := make([][]byte, 0, body.TxCount-2)
+			for i := 0; i < int(body.TxCount)-2; i++ {
+				v, err := tx.GetOne(kv.EthTx, hexutil.EncodeTs(body.BaseTxnID.At(i)))
+				if err != nil {
+					return err
+				}
+				txs = append(txs, v)
+			}
+			res[n] = txs
+		}
+		return nil
+	}))
+	return res
+}
+
+// DB txn ids run ahead of the canonical numbering once the node has stored a non-canonical body, and
+// frozen bodies are pruned a few at a time, so some are still in the DB when the migration writes
+// the tail back at canonical ids. Pruning them afterwards must not take the tail's transactions.
+func TestEpochMigration_TailSurvivesPruningShiftedBodies(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+	logger := log.New()
+	m := newMigrationFixture(t, logger)
+	dumpAllDecimal(t, m, logger)
+	want := readTailTxs(t, m)
+	shiftDBTxnIDs(t, m, 2)
+
+	require.NoError(t, migrate(t, m, logger))
+	require.NoError(t, m.DB.Update(m.Ctx, func(tx kv.RwTx) error {
+		_, err := rawdb.PruneBlocks(tx, migrationTailFrom, migrationChainSize)
+		return err
+	}))
+
+	require.Equal(t, want, readTailTxs(t, m))
+}
+
+// A decimal segment that survives the final cleanup, like one held open on Windows, would be opened
+// beside the epoch segments covering the same blocks, so the migration must fail instead of finishing.
+// The next run deletes it.
+func TestEpochMigration_FailsWhileADecimalSegmentSurvivesCleanup(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+	logger := log.New()
+	m := newMigrationFixture(t, logger)
+	dumpAllDecimal(t, m, logger)
+	straddle := filepath.Join(m.dirs.Snap, snaptype.SegmentFileName(version.V1_0, false, 2000, migrationChainSize, snaptype2.Headers.Enum()))
+	content, err := os.ReadFile(straddle)
+	require.NoError(t, err)
+
+	var restored bool
+	restore := freezeblocks.SetEpochMigrationCrashHook(func() error {
+		if _, statErr := os.Stat(straddle); os.IsNotExist(statErr) {
+			restored = true
+			return os.WriteFile(straddle, content, 0o644)
+		}
+		return nil
+	})
+	require.Error(t, migrate(t, m, logger))
+	restore()
+	require.True(t, restored)
+
+	require.NoError(t, migrate(t, m, logger))
+	requireEpochOnly(t, m)
+}
+
+// A decimal file above a gap in the transactions is dropped by the final cleanup, not converted. If it
+// survives that cleanup, the next run finds epoch segments and then a decimal file past a hole, which
+// reads as missing blocks, so the cleanup has to resume on its own.
+func TestEpochMigration_ResumesCleanupAboveAGap(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+	logger := log.New()
+	m := newMigrationFixture(t, logger)
+	dumpDecimalTypes(t, m, decimalBounds, logger, snaptype2.Headers, snaptype2.Bodies)
+	dumpDecimalTypes(t, m, []uint64{0, 1000, 2000}, logger, snaptype2.Transactions)
+	dumpDecimalTypes(t, m, []uint64{2500, migrationChainSize}, logger, snaptype2.Transactions)
+	aboveGap := filepath.Join(m.dirs.Snap, snaptype.SegmentFileName(version.V1_0, false, 2500, migrationChainSize, snaptype2.Transactions.Enum()))
+	content, err := os.ReadFile(aboveGap)
+	require.NoError(t, err)
+
+	var restored bool
+	restore := freezeblocks.SetEpochMigrationCrashHook(func() error {
+		if _, statErr := os.Stat(aboveGap); os.IsNotExist(statErr) {
+			restored = true
+			return os.WriteFile(aboveGap, content, 0o644)
+		}
+		return nil
+	})
+	require.Error(t, migrate(t, m, logger))
+	restore()
+	require.True(t, restored)
+
+	require.NoError(t, migrate(t, m, logger))
+	require.False(t, decimalSegsLeft(t, m))
+	pending, err := freezeblocks.EpochMigrationPending(m.Ctx, m.DB, m.dirs, m.ChainConfig)
+	require.NoError(t, err)
+	require.False(t, pending)
+}
+
+// The transactions repack reads the bodies to know each block's txn count, and lines the two up only
+// when transactions start above bodies, the shape pruning leaves. Bodies starting above transactions
+// would pair every block with another block's transactions, so the migration refuses before it
+// changes anything.
+func TestEpochMigration_RefusesBodiesStartingAboveTransactions(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+	logger := log.New()
+	m := newMigrationFixture(t, logger)
+	dumpDecimalTypes(t, m, decimalBounds, logger, snaptype2.Headers, snaptype2.Transactions)
+	dumpDecimalTypes(t, m, decimalBounds[1:], logger, snaptype2.Bodies)
+	before := snapState(t, m.dirs)
+
+	err := migrate(t, m, logger)
+	t.Logf("migrate: %v", err)
+	require.ErrorContains(t, err, "bodies")
+
+	require.Equal(t, before, snapState(t, m.dirs), "nothing is converted or deleted")
+	pending, err := freezeblocks.EpochMigrationPending(m.Ctx, m.DB, m.dirs, m.ChainConfig)
+	require.NoError(t, err)
+	require.True(t, pending, "the decimal segments are still there and no marker was set")
+}

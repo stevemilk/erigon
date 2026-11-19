@@ -37,7 +37,6 @@ import (
 	"github.com/erigontech/erigon/common/dbg"
 	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/db/snaptype"
-	"github.com/erigontech/erigon/db/version"
 	ver "github.com/erigontech/erigon/db/version"
 	"github.com/erigontech/erigon/execution/chain/networkname"
 )
@@ -242,6 +241,13 @@ func (p Preverified) Typed(types []snaptype.Type) Preverified {
 
 		//typeName, _ := strings.CutSuffix(parts[2], filepath.Ext(parts[2]))
 		typeName := name[lastSep+1 : dot]
+		// An epoch segment carries the "ep" marker as a suffix on the type, so the last dash-separated
+		// token is the marker; the type is the one before it.
+		if typeName == snaptype.EpochMarker {
+			if prevSep := strings.LastIndex(name[:lastSep], "-"); prevSep >= 0 {
+				typeName = name[prevSep+1 : lastSep]
+			}
+		}
 		include := false
 		idxIndex := 0
 		if strings.Contains(name, "transactions-to-block") { // transactions-to-block should just be "transactions" type
@@ -254,7 +260,7 @@ func (p Preverified) Typed(types []snaptype.Type) Preverified {
 
 		for _, typ := range types {
 			if typeName == typ.Name() {
-				var versions version.Versions
+				var versions ver.Versions
 				if strings.HasSuffix(p.Name, "idx") {
 					versions = typ.Indexes()[idxIndex].Version
 				} else {
@@ -329,25 +335,26 @@ func (p Preverified) MaxBlock(version ver.Version) (uint64, error) {
 		if ext != ".seg" {
 			continue
 		}
+		name := fileName[:len(fileName)-len(ext)]
 
-		to, err := ExtractBlockFromName(fileName[:len(fileName)-len(ext)], version)
+		to, err := ExtractBlockFromName(name, version)
 		if err != nil {
 			if errors.Is(err, errWrongVersion) {
 				continue
 			}
 			return 0, err
 		}
-
-		if _max < to {
-			_max = to
+		unit := uint64(snaptype.Erigon2MinSegmentSize)
+		if strings.HasSuffix(name, "-"+snaptype.EpochMarker) {
+			unit = snaptype.EpochMinSegmentSize
 		}
-
+		_max = max(_max, to*unit)
 	}
 	if _max == 0 { // to prevent underflow
 		return 0, nil
 	}
 
-	return _max*1_000 - 1, nil
+	return _max - 1, nil
 }
 
 var errWrongVersion = errors.New("wrong version")
@@ -392,6 +399,7 @@ func ExtractBlockFromName(name string, v ver.Version) (block uint64, err error) 
 
 	return block, nil
 }
+
 func fromToml(in []byte) PreverifiedItems {
 	var outMap map[string]string
 	if err := toml.Unmarshal(in, &outMap); err != nil {
@@ -424,7 +432,7 @@ func newCfg(networkName string, preverified Preverified) *Cfg {
 type Cfg struct {
 	ExpectBlocks      uint64
 	Preverified       Preverified          // immutable
-	PreverifiedParsed []*snaptype.FileInfo //Preverified field after `snaptype.ParseFileName("", p.Name)`
+	PreverifiedParsed []*snaptype.FileInfo // Preverified field after `snaptype.ParseFileName("", p.Name)`
 	// The preverified list were loaded from local storage. That means they were committed after an
 	// initial sync completed successfully.
 	Local       bool
@@ -433,21 +441,25 @@ type Cfg struct {
 
 // Seedable - can seed it over Bittorrent network to other nodes
 func (c Cfg) Seedable(info snaptype.FileInfo) bool {
-	mergeLimit := c.MergeLimit(info.Type.Enum(), info.From)
+	mergeLimit := c.MergeLimit(info.Type.Enum(), info.Epoch, info.From)
 	return info.To-info.From == mergeLimit
 }
 
 // IsFrozen - can't be merged to bigger files
 func (c Cfg) IsFrozen(info snaptype.FileInfo) bool {
-	mergeLimit := c.MergeLimit(info.Type.Enum(), info.From)
+	mergeLimit := c.MergeLimit(info.Type.Enum(), info.Epoch, info.From)
 	return info.To-info.From >= mergeLimit
 }
 
-func (c Cfg) MergeLimit(t snaptype.Enum, fromBlock uint64) uint64 {
+func (c Cfg) MergeLimit(t snaptype.Enum, epoch bool, fromBlock uint64) uint64 {
 	// Caplin entries are skipped below and no core entry can match a caplin enum, so the
-	// scan is a no-op for these types — and IsFrozen calls this per segment opened.
+	// scan is a no-op for these types — and IsFrozen calls this per segment opened. It shards by
+	// slot rather than by block, so it keeps its own limit even on an epoch chain.
 	if snaptype.IsCaplinType(t) {
 		return snaptype.CaplinMergeLimit
+	}
+	if epoch {
+		return snaptype.EpochMergeLimit
 	}
 
 	hasType := t == snaptype.MinCoreEnum
@@ -485,7 +497,7 @@ func (c Cfg) MergeLimit(t snaptype.Enum, fromBlock uint64) uint64 {
 		return snaptype.Erigon2MergeLimit
 	}
 
-	return c.MergeLimit(snaptype.MinCoreEnum, fromBlock)
+	return c.MergeLimit(snaptype.MinCoreEnum, epoch, fromBlock)
 }
 
 func RegisterKnownTypes(networkName string, types []snaptype.Type) {
@@ -494,17 +506,20 @@ func RegisterKnownTypes(networkName string, types []snaptype.Type) {
 
 var knownTypes = map[string][]snaptype.Type{}
 
-func MergeLimitFromCfg(cfg *Cfg, snapType snaptype.Enum, fromBlock uint64) uint64 {
-	return cfg.MergeLimit(snapType, fromBlock)
+func MergeLimitFromCfg(cfg *Cfg, snapType snaptype.Enum, epoch bool, fromBlock uint64) uint64 {
+	return cfg.MergeLimit(snapType, epoch, fromBlock)
 }
 
 var oldMergeSteps = append([]uint64{snaptype.Erigon2OldMergeLimit}, snaptype.MergeSteps...)
 
-func MergeStepsFromCfg(cfg *Cfg, snapType snaptype.Enum, fromBlock uint64) []uint64 {
-	mergeLimit := MergeLimitFromCfg(cfg, snapType, fromBlock)
+func MergeStepsFromCfg(cfg *Cfg, snapType snaptype.Enum, epoch bool, fromBlock uint64) []uint64 {
+	mergeLimit := MergeLimitFromCfg(cfg, snapType, epoch, fromBlock)
 
-	if mergeLimit == snaptype.Erigon2OldMergeLimit {
+	switch mergeLimit {
+	case snaptype.Erigon2OldMergeLimit:
 		return oldMergeSteps
+	case snaptype.EpochMergeLimit:
+		return snaptype.EpochMergeSteps
 	}
 
 	return snaptype.MergeSteps

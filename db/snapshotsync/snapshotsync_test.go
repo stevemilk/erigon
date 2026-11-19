@@ -19,11 +19,14 @@ package snapshotsync
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
+	"github.com/erigontech/erigon/db/config3"
 	"github.com/erigontech/erigon/db/dbservices"
 	"github.com/erigontech/erigon/db/kv"
 	"github.com/erigontech/erigon/db/kv/dbcfg"
@@ -32,6 +35,8 @@ import (
 	"github.com/erigontech/erigon/db/kv/rawdbv3"
 	"github.com/erigontech/erigon/db/snapcfg"
 	"github.com/erigontech/erigon/db/snaptype"
+	"github.com/erigontech/erigon/db/snaptype2"
+	"github.com/erigontech/erigon/db/version"
 	"github.com/erigontech/erigon/execution/chain"
 	"github.com/erigontech/erigon/execution/chain/networkname"
 )
@@ -103,7 +108,7 @@ func TestBlackListForPruning(t *testing.T) {
 	const blockPrune uint64 = 25_000_000
 	// effectiveCutoff mirrors the internal adjustBlockPrune clamp; without
 	// it the assertion accepts segments above the cutoff the function actually used.
-	effectiveCutoff := adjustBlockPrune(blockPrune, minBlockToDownload)
+	effectiveCutoff := adjustBlockPrune(false, blockPrune, minBlockToDownload)
 	blackList, err := buildBlackListForPruning(prune.MinimalMode, nil, stepPrune, 0, 0, minBlockToDownload, blockPrune, preverified)
 	if err != nil {
 		t.Fatal(err)
@@ -496,8 +501,8 @@ func TestGetMinimumBlocksToDownload_CutoffBelowFrozenBodies(t *testing.T) {
 }
 
 // TestReceiptsSegmentRetentionCutoff: when blocks are kept but state history is
-// pruned, rcache history must follow state history (so download agrees with
-// retirement) while log indexes follow block data; the windows coincide otherwise.
+// pruned, both rcache history and the log indexes must follow state history, so
+// download agrees with retirement instead of fetching files it then deletes.
 func TestReceiptsSegmentRetentionCutoff(t *testing.T) {
 	const head = 1_000_000
 	rcacheSeg := "history/v1.0-" + kv.RCacheDomain.String() + ".0-64.v"
@@ -507,7 +512,8 @@ func TestReceiptsSegmentRetentionCutoff(t *testing.T) {
 	assert.NotZero(t, blocksHistory, "blocks-mode history window must be finite")
 	assert.Equal(t, uint64(0), blocksRetentionCutoff(prune.BlocksMode, nil, head), "blocks-mode blocks window is keep-all")
 	assert.Equal(t, blocksHistory, receiptsSegmentRetentionCutoff(prune.BlocksMode, nil, head, rcacheSeg))
-	assert.Equal(t, uint64(0), receiptsSegmentRetentionCutoff(prune.BlocksMode, nil, head, logIdxSeg))
+	assert.Equal(t, blocksHistory, receiptsSegmentRetentionCutoff(prune.BlocksMode, nil, head, logIdxSeg),
+		"a blocks-mode node must not download log indexes that execution retirement then deletes")
 
 	assert.Equal(t, blocksRetentionCutoff(prune.MinimalMode, nil, head), receiptsSegmentRetentionCutoff(prune.MinimalMode, nil, head, rcacheSeg))
 }
@@ -584,4 +590,99 @@ func TestGetMaxStepRangeInSnapshots(t *testing.T) {
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "invalid domain snapshot filename")
 	})
+}
+
+// KeepAllBlocksPruneMode means follow-history for receipts, not keep-all.
+func TestReceiptsSegmentRetentionCutoff_FollowsHistoryWindow(t *testing.T) {
+	t.Parallel()
+	const head = 23_000_000
+	const rcacheName = "history/v1.0-rcache.100-200.v"
+
+	for _, tc := range []struct {
+		name string
+		mode prune.Mode
+		want uint64
+	}{
+		{"minimal keeps only its history window", prune.MinimalMode, head - config3.MinimalPruneDistance},
+		{"full keeps only its history window", prune.FullMode, head - config3.DefaultPruneDistance},
+		{"blocks keeps only its history window", prune.BlocksMode, head - config3.DefaultPruneDistance},
+		{"archive keeps everything", prune.ArchiveMode, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.True(t, tc.mode.ReceiptsFollowHistory(),
+				"presets leave Receipts unset, which for receipts means follow-history")
+			require.Equal(t, tc.want, receiptsSegmentRetentionCutoff(tc.mode, nil, head, rcacheName))
+		})
+	}
+
+	require.Equal(t, uint64(head-config3.MinimalPruneDistance),
+		receiptsSegmentRetentionCutoff(prune.MinimalMode, nil, head, "idx/v1.0-logaddrs.100-200.ef"))
+	require.Zero(t, receiptsSegmentRetentionCutoff(prune.ArchiveMode, nil, head, "idx/v1.0-logaddrs.100-200.ef"))
+}
+
+// A manifest that lists a block type only in the other segment layout would leave a fresh node with no
+// block files, and the empty request would then be pinned in preverified.toml, so it must fail.
+func TestCheckManifestRegime(t *testing.T) {
+	decimal := snapcfg.PreverifiedItems{
+		{Name: "v1.1-000000-000500-headers.seg", Hash: "a"},
+		{Name: "v1.1-000000-000500-bodies.seg", Hash: "b"},
+		{Name: "v1.1-000000-000500-transactions.seg", Hash: "c"},
+		{Name: "v1.1-000000-000500-headers.idx", Hash: "d"},
+		{Name: "salt-blocks.txt", Hash: "e"},
+	}
+	epoch := snapcfg.PreverifiedItems{
+		{Name: "v1.1-000000-000512-headers-ep.seg", Hash: "f"},
+		{Name: "v1.1-000000-000512-bodies-ep.seg", Hash: "g"},
+		{Name: "v1.1-000000-000512-transactions-ep.seg", Hash: "h"},
+	}
+	epochHeadersDecimalTxs := snapcfg.PreverifiedItems{epoch[0], epoch[1], decimal[2]}
+	both := append(append(snapcfg.PreverifiedItems{}, decimal...), epoch...)
+
+	full := requiredBlockTypes(false, AlsoCaplin)
+	headers := requiredBlockTypes(true, AlsoCaplin)
+	for _, tc := range []struct {
+		name     string
+		items    snapcfg.PreverifiedItems
+		epoch    bool
+		required []snaptype.Type
+		wantErr  bool
+	}{
+		{"decimal manifest on an epoch chain", decimal, true, full, true},
+		{"epoch manifest on a decimal chain", epoch, false, full, true},
+		{"both layouts", both, true, full, false},
+		{"matching layout", decimal, false, full, false},
+		{"empty manifest", nil, true, full, false},
+		{"header chain needs no transactions", epochHeadersDecimalTxs, true, headers, false},
+		{"full sync needs transactions", epochHeadersDecimalTxs, true, full, true},
+		{"caplin only", decimal, true, requiredBlockTypes(false, OnlyCaplin), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := checkManifestRegime(tc.items, tc.epoch, tc.required)
+			if tc.wantErr {
+				require.ErrorIs(t, err, ErrNoBlockSegmentsInRegime)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+// An epoch chain retires transaction files a whole top-tier window at a time, and a download has to
+// skip them on the same boundary: a window that starts in the middle never merges into its top-tier
+// file, and headers and bodies merge along with the transactions.
+func TestBlackListForPruningKeepsWholeEpochWindow(t *testing.T) {
+	const window = snaptype.EpochMergeLimit
+	name := func(from, to uint64) string {
+		return snaptype.SegmentFileName(version.V1_1, true, from, to, snaptype2.Enums.Transactions)
+	}
+	preverified := snapcfg.Preverified{Items: snapcfg.PreverifiedItems{
+		{Name: name(0, window)},
+		{Name: name(window, window+65_536)},
+		{Name: name(window+65_536, window+131_072)},
+		{Name: name(window+131_072, window+196_608)},
+	}}
+
+	blackList, err := buildBlackListForPruning(prune.FullMode, &chain.Config{}, 0, 0, 0, math.MaxUint64, window+150_000, preverified)
+	require.NoError(t, err)
+	require.Equal(t, map[string]struct{}{name(0, window): {}}, blackList)
 }

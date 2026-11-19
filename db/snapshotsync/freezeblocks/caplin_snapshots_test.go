@@ -82,10 +82,10 @@ func TestDumpBeaconBlocksRangeBuildsSegAndIdx(t *testing.T) {
 		for slot := uint64(0); slot < snaptype.CaplinMergeLimit; slot += 500 {
 			var root common.Hash
 			binary.BigEndian.PutUint64(root[:], slot+1)
-			if err := beacon_indicies.MarkRootCanonical(ctx, tx, slot, root); err != nil {
+			if err := beacon_indicies.MarkRootCanonical(tx, slot, root); err != nil {
 				return err
 			}
-			if err := beacon_indicies.WriteParentBlockRoot(ctx, tx, root, prevRoot); err != nil {
+			if err := beacon_indicies.WriteParentBlockRoot(tx, root, prevRoot); err != nil {
 				return err
 			}
 			if err := tx.Put(kv.BeaconBlocks, dbutils.BlockBodyKey(slot, root), root[:]); err != nil {
@@ -98,7 +98,7 @@ func TestDumpBeaconBlocksRangeBuildsSegAndIdx(t *testing.T) {
 
 	require.NoError(t, dumpBeaconBlocksRange(ctx, db, 0, snaptype.CaplinMergeLimit, 1, dirs, 1, log.LvlDebug, log.New()))
 
-	segName := snaptype.BeaconBlocks.FileName(version.ZeroVersion, 0, snaptype.CaplinMergeLimit)
+	segName := snaptype.BeaconBlocks.FileName(version.ZeroVersion, false, 0, snaptype.CaplinMergeLimit)
 	f, _, ok := snaptype.ParseFileName(dirs.Snap, segName)
 	require.True(t, ok)
 
@@ -217,7 +217,7 @@ func slotWord(slot uint64) []byte {
 
 func writeCaplinSegment(t *testing.T, dirs datadir.Dirs, sType snaptype.Type, from, to uint64, withIndex bool, word func(slot uint64) []byte) {
 	t.Helper()
-	segName := sType.FileName(version.ZeroVersion, from, to)
+	segName := sType.FileName(version.ZeroVersion, false, from, to)
 	f, _, ok := snaptype.ParseFileName(dirs.Snap, segName)
 	require.True(t, ok)
 

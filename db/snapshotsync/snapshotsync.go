@@ -81,22 +81,28 @@ func RequestSnapshotsDownload(
 	return nil
 }
 
-func adjustBlockPrune(blocks, minBlocksToDownload uint64) uint64 {
-	if minBlocksToDownload < snaptype.Erigon2MergeLimit {
-		minBlocksToDownload = snaptype.Erigon2MergeLimit
+func adjustBlockPrune(epoch bool, blocks, minBlocksToDownload uint64) uint64 {
+	mergeLimit := uint64(snaptype.Erigon2MergeLimit)
+	if epoch {
+		mergeLimit = snaptype.EpochMergeLimit
+	}
+	if minBlocksToDownload < mergeLimit {
+		minBlocksToDownload = mergeLimit
 	}
 	if blocks > minBlocksToDownload {
 		blocks = minBlocksToDownload
 	}
-	return blocks - blocks%snaptype.Erigon2MergeLimit
+	return blocks - blocks%mergeLimit
 }
 
 func isStateSnapshot(name string) bool {
 	return isStateHistory(name) || strings.HasPrefix(name, "domain")
 }
+
 func isStateHistory(name string) bool {
 	return strings.HasPrefix(name, "idx") || strings.HasPrefix(name, "history") || strings.HasPrefix(name, "accessor")
 }
+
 func canSnapshotBePruned(name string) bool {
 	return isStateHistory(name) || strings.Contains(name, "transactions")
 }
@@ -112,7 +118,6 @@ func buildBlackListForPruning(
 	historyStepPrune, minCommitmentHistoryStep, minReceiptsStep kv.Step, minBlockToDownload, blockPrune uint64,
 	preverified snapcfg.Preverified,
 ) (map[string]struct{}, error) {
-
 	blackList := make(map[string]struct{})
 
 	historyEnabled := pruneMode.History.Enabled()
@@ -126,7 +131,7 @@ func buildBlackListForPruning(
 	}
 
 	if blocksEnabled {
-		blockPrune = adjustBlockPrune(blockPrune, minBlockToDownload)
+		blockPrune = adjustBlockPrune(snaptype2.RegimeFor(cc), blockPrune, minBlockToDownload)
 	}
 
 	for _, p := range preverified.Items {
@@ -345,10 +350,16 @@ func historyRetentionCutoff(pruneMode prune.Mode, head uint64) uint64 {
 }
 
 // receiptsSegmentRetentionCutoff picks the download cutoff for a receipt-related
-// segment: rcache history follows state history (so download agrees with rcache
-// retirement in historyRetireCutoffs), log indexes follow block data.
+// segment, matching what historyRetireCutoffs later retires it by: rcache
+// history follows state history, and so do the log indexes, which are plain
+// inverted indexes and take RetireCutoffs.Default. Downloading them on the
+// block window instead would fetch a keep-all node's full history only to
+// delete everything outside the state-history window.
 func receiptsSegmentRetentionCutoff(pruneMode prune.Mode, cc *chain.Config, head uint64, name string) uint64 {
-	if pruneMode.ReceiptsFollowHistory() && strings.Contains(name, kv.RCacheDomain.String()) {
+	isLogIndex := strings.Contains(name, kv.LogAddrIdx.String()) ||
+		strings.Contains(name, kv.LogTopicIdx.String())
+	isRcacheHistory := pruneMode.ReceiptsFollowHistory() && strings.Contains(name, kv.RCacheDomain.String())
+	if isLogIndex || isRcacheHistory {
 		return historyRetentionCutoff(pruneMode, head)
 	}
 	return blocksRetentionCutoff(pruneMode, cc, head)
@@ -447,13 +458,16 @@ func SyncSnapshots(
 		log.Info(fmt.Sprintf("[%s] Preparing snapshots request for %s", logPrefix, task))
 
 		frozenBlocks := blockReader.Snapshots().SegmentsMax()
-		//Corner cases:
+		// Corner cases:
 		// - Erigon generated file X with hash H1. User upgraded Erigon. New version has preverified file X with hash H2. Must ignore H2 (don't send to Downloader)
 		// - Erigon "download once": means restart/upgrade/downgrade must not download files (and will be fast)
 		// - After "download once" - Erigon will produce and seed new files
 
 		// send all hashes to the Downloader service
 		preverifiedBlockSnapshots := snapCfg.Preverified
+		if err := checkManifestRegime(preverifiedBlockSnapshots.Items, snaptype2.RegimeFor(cc), requiredBlockTypes(headerchain, caplin)); err != nil {
+			return fmt.Errorf("[%s] %w", logPrefix, err)
+		}
 		downloadRequest := make([]dbservices.DownloadRequest, 0, len(preverifiedBlockSnapshots.Items))
 
 		blockPrune, historyPrune := computeBlocksToPrune(blockReader, prune)
@@ -467,7 +481,8 @@ func SyncSnapshots(
 			commitmentHistoryPrune := prune.CommitmentHistoryAmount().PruneTo(frozenBlocks)
 			receiptsPrune := prune.ReceiptsAmount().PruneTo(frozenBlocks)
 			minBlockToDownload, minHistoryStep, minCommitmentHistoryStep, minReceiptsStep, err := getMinimumBlocksToDownload(
-				ctx, blockReader, tx, maxStateStep, stepSize, historyPrune, commitmentHistoryPrune, receiptsPrune)
+				ctx, blockReader, tx, maxStateStep, stepSize, historyPrune, commitmentHistoryPrune, receiptsPrune,
+			)
 			if err != nil {
 				return err
 			}
@@ -553,6 +568,10 @@ func SyncSnapshots(
 				continue
 			}
 
+			if snaptype.EpochRegimeMismatch(p.Name, snaptype2.RegimeFor(cc)) {
+				continue
+			}
+
 			downloadRequest = append(downloadRequest, dbservices.DownloadRequest{
 				Path:        p.Name,
 				TorrentHash: p.Hash,
@@ -586,6 +605,59 @@ func SyncSnapshots(
 	return nil
 }
 
+// ErrNoBlockSegmentsInRegime means the snapshot manifest lists a block type only in the other segment
+// layout, so a download would fetch none of it.
+var ErrNoBlockSegmentsInRegime = errors.New("snapshot manifest has no block segments in this chain's layout")
+
+// requiredBlockTypes are the block types a download cannot go without: headers and bodies for the
+// header chain, and transactions too for a full sync. A Caplin-only download needs none.
+func requiredBlockTypes(headerchain bool, caplin CaplinMode) []snaptype.Type {
+	if caplin == OnlyCaplin {
+		return nil
+	}
+	if headerchain {
+		return []snaptype.Type{snaptype2.Headers, snaptype2.Bodies}
+	}
+	return []snaptype.Type{snaptype2.Headers, snaptype2.Bodies, snaptype2.Transactions}
+}
+
+// checkManifestRegime fails when the manifest lists a required block type, but none of it in the
+// chain's segment layout. Requesting nothing would leave the node without block files, and the
+// manifest would then be pinned in preverified.toml.
+func checkManifestRegime(items snapcfg.PreverifiedItems, epoch bool, required []snaptype.Type) error {
+	for _, t := range required {
+		var listed, usable bool
+		for _, p := range items {
+			fi, _, ok := snaptype.ParseFileName("", p.Name)
+			if !ok || fi.Type == nil || fi.Type.Enum() != t.Enum() || fi.Ext != ".seg" {
+				continue
+			}
+			listed = true
+			if fi.Epoch == epoch {
+				usable = true
+				break
+			}
+		}
+		if listed && !usable {
+			layout := "decimal"
+			if epoch {
+				layout = "epoch"
+			}
+			return fmt.Errorf("%w: %s segments are listed only in the other layout, and this chain uses the %s layout; "+
+				"this build cannot sync from the manifest until it lists %s segments", ErrNoBlockSegmentsInRegime, t.Name(), layout, layout)
+		}
+	}
+	return nil
+}
+
+// BlockFileRetainedUnderCap reports whether a block-segment file ending at
+// `to` survives a download capped at toBlock; toBlock == 0 means no cap.
+// Callers deriving a block target must use this same rule, so the target and
+// the downloaded byte total describe the same file set.
+func BlockFileRetainedUnderCap(to, toBlock uint64) bool {
+	return toBlock == 0 || to <= toBlock
+}
+
 func filterToBlock(name string, toBlock uint64, toStep kv.Step, headerchain bool) bool {
 	if toBlock == 0 {
 		return false // toBlock filtering is not enabled
@@ -608,5 +680,5 @@ func filterToBlock(name string, toBlock uint64, toStep kv.Step, headerchain bool
 		// so that we can correctly calculate its maxTxNum from the body segment files (we will later on delete this file)
 		return fileInfo.From > toBlock
 	}
-	return fileInfo.To > toBlock
+	return !BlockFileRetainedUnderCap(fileInfo.To, toBlock)
 }
